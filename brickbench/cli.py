@@ -9,7 +9,7 @@ from brickbench.config import __version__
 
 
 # ---------------------------------------------------------------------------
-# Click groups
+# Click group
 # ---------------------------------------------------------------------------
 
 @click.group()
@@ -19,33 +19,9 @@ def cli():
     pass
 
 
-@click.group()
-def target():
-    """Target management (build, list, snapshot)."""
-    pass
-
-
-@click.group()
-def run_():
-    """Run management (matrix, execute, resume)."""
-    pass
-
-
-@click.group()
-def provider_():
-    """Model provider discovery & quota."""
-    pass
-
-
 # ---------------------------------------------------------------------------
-# CLI commands
+# CLI commands — direct subcommands of `cli`
 # ---------------------------------------------------------------------------
-
-@click.command("version")
-def version_cmd():
-    """Print the brickbench version."""
-    click.echo("brickbench " + __version__)
-
 
 @cli.command("init")
 def init_cmd():
@@ -103,13 +79,97 @@ def resume_cmd():
     conn.close()
 
 
+@cli.command("run")
+@click.option("--max-emulator", default=1, type=int, help="Max concurrent emulator instances.")
+@click.option("--max-llm", default=None, type=int, help="Max parallel LLM calls (per-provider quota).")
+@click.option("--providers", multiple=True, default=[], help="Provider tags to include (zen agy codex openrouter).")
+@click.option("--targets", multiple=True, default=[], help="Target tags to include.")
+@click.option("--modes", multiple=True, default=["plan_only", "live"], help="Eval modes.")
+@click.option("--debloat-modes", multiple=True, default=["uninstall"], help="Debloat mode(s).")
+@click.option("--prompt-variants", multiple=True, default=["baseline"], help="Prompt variant tags.")
+def run_command(
+    max_emulator: int,
+    max_llm: Optional[int],
+    providers: Tuple[str, ...],
+    targets: Tuple[str, ...],
+    modes: Tuple[str, ...],
+    debloat_modes: Tuple[str, ...],
+    prompt_variants: Tuple[str, ...],
+):
+    """Execute the full brickbench matrix.
+
+    This builds the Cartesian product of the given dimensions and runs each
+    cell through the runner, persisting everything to the data dir.
+    """
+    from brickbench.config import PROCESS_PROVIDERS
+
+    # Resolve target keys
+    target_keys = list(targets) if targets else ["aosp-vanilla", "aosp-gapps", "aosp-play", "lineage-23.2", "e-os-gsi"]
+
+    # Resolve model IDs per provider
+    model_cfgs: Dict[str, List[str]] = {}
+    for p in providers or PROCESS_PROVIDERS:
+        if p == "zen":
+            model_cfgs["zen"] = [
+                "fledge-alpha-free", "ling-3.1-flash-free", "longcat-2.5-preview-free",
+                "space-bunny-free", "mimo-v2.6-flash-free", "muse-spark-1.3-contributor-free",
+                "ling-3.0-flash-fin-free", "nemotron-3.5-lightning-free", "nemotron-3-ultra-free",
+                "big-pickle",
+            ]
+        elif p == "agy":
+            model_cfgs["agy"] = [
+                "gemini-3.8-flash-high", "gemini-3.8-flash-medium", "gemini-3.8-flash-low",
+                "gemini-3.7-flash-high", "gemini-3.7-flash-medium", "gemini-3.7-flash-low",
+                "gemini-3.6-flash-high", "gemini-3.6-flash-medium", "gemini-3.6-flash-low",
+                "gemini-3.1-pro-high", "gemini-3.1-pro-low",
+                "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium",
+            ]
+        elif p == "codex":
+            model_cfgs["codex"] = ["gpt-6-luna"]
+        elif p == "openrouter":
+            model_cfgs["openrouter"] = [
+                "qwen/qwen3.8-27b:free", "google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free",
+                "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3.5-lightning:free",
+                "nvidia/nemotron-3-super-120b-a12b:free", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+                "thinkingmachines/inkling:free", "thinkingmachines/inkling-small:free",
+                "poolside/laguna-s-2.1:free", "poolside/laguna-xs-2.1:free",
+                "cohere/north-mini-code:free", "dots-studio/dots-3-note-preview:free",
+                "inclusionai/ling-3.0-flash-sante:free", "liquid/lfm-2.5-2.6b:free",
+                "apodex/apodex-1.1-mini:free", "nvidia/nemotron-3.5-content-safety:free",
+            ]
+        else:
+            continue
+
+    from brickbench.runner import Runner
+
+    runner = Runner(data_dir="data/runs", max_emulator_concurrency=max_emulator, llm_concurrency=max_llm)
+
+    try:
+        total = 0
+        for tk in target_keys:
+            for pid, models in model_cfgs.items():
+                for mid in models:
+                    for mode in modes:
+                        for dmode in debloat_modes:
+                            for pv in prompt_variants:
+                                rid = runner.enqueue(
+                                    target_key=tk,
+                                    model_id=mid,
+                                    prompt_variant=pv,
+                                    mode=mode,
+                                    debloat_mode=dmode,
+                                )
+                                total += 1
+        click.echo("🧱 Enqueued " + str(total) + " matrix cells into data/runs/")
+    finally:
+        runner.close()
+
+
 # ---------------------------------------------------------------------------
 # Module-level entry points
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__" and __package__ is None:
-    # invoked as `python brickbench/cli.py` — dispatch to click CLI
     cli()
 elif __name__ == "__main__":
-    # invoked as `python -m brickbench.cli` — same
     cli()
