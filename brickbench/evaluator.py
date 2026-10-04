@@ -10,17 +10,12 @@ Responsibilities
 
 from __future__ import annotations
 
-import json
-import os
 import subprocess
 import sqlite3
-import time
-import shutil
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from brickbench.config import RATE_LIMITS, DEFAULT_EMU_RAM_MB, DEBLOAT_MODES, PROCESS_MODES
 
 # ---------------------------------------------------------------------------
 # Dataclasses
@@ -60,7 +55,7 @@ class VerificationResult:
 
 def _sqlite_conn(data_dir: any) -> sqlite3.Connection:
     """Open (or create) the brickbench SQLite database."""
-    db_path = data_dir / "brickbench.db" if isinstance(data_dir, type) else Path(str(data_dir)) / "brickbench.db"
+    db_path = Path(str(data_dir)) / "brickbench.db"
     conn = sqlite3.connect(str(db_path))
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(
@@ -250,38 +245,40 @@ def probe_package(
     fast-path hits.
     """
     import hashlib
-    from brickbench.evaluator import PackageVerdict, _safe_list_record, _sqlite_conn
 
     db = _sqlite_conn(data_dir)
-    sv = _safe_list_load(db)
-    verdict_key = f"{target_key}|{pkg_name}|{action}"
+    try:
+        sv = _safe_list_load(db)
+        verdict_key = f"{target_key}|{pkg_name}|{action}"
 
-    # ---- Fast-path: already cached? ----
-    if verdict_key in sv:
-        return sv[verdict_key]
+        # ---- Fast-path: already cached? ----
+        if verdict_key in sv:
+            return sv[verdict_key]
 
-    # ---- Slow-path: verify via the emulator ----
-    plan_hash = hashlib.sha256(
-        f"{target_key}:{pkg_name}:{action}".encode()).hexdigest()[:16]
+        # ---- Slow-path: verify via the emulator ----
+        plan_hash = hashlib.sha256(
+            f"{target_key}:{pkg_name}:{action}".encode()).hexdigest()[:16]
 
-    verify_plan(
-        target_key=target_key,
-        plan_hash=plan_hash,
-        plan_actions=[{"pkg": pkg_name, "action": action}],
-        dossier=dossier,
-        model_id="probe",
-        prompt_variant="probe",
-        mode="live",
-        debloat_mode="uninstall",
-        data_dir=data_dir,
-    )
+        verify_plan(
+            target_key=target_key,
+            plan_hash=plan_hash,
+            plan_actions=[{"pkg": pkg_name, "action": action}],
+            dossier=dossier,
+            model_id="probe",
+            prompt_variant="probe",
+            mode="live",
+            debloat_mode="uninstall",
+            data_dir=data_dir,
+        )
 
-    # Re-read the verdict that was just persisted
-    sv = _safe_list_load(db)
-    return sv.get(verdict_key, PackageVerdict(
-        target=target_key, pkg_name=pkg_name, action=action, outcome="risky",
-        evidence="probe sweep",
-    ))
+        # Re-read the verdict that was just persisted
+        sv = _safe_list_load(db)
+        return sv.get(verdict_key, PackageVerdict(
+            target=target_key, pkg_name=pkg_name, action=action, outcome="risky",
+            evidence="probe sweep",
+        ))
+    finally:
+        db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -305,62 +302,69 @@ def verify_plan(
     for 30–90 s of wall time per unique (target, plan) pair.
     """
     db = _sqlite_conn(data_dir)
-    sv = _safe_list_load(db)
+    try:
+        sv = _safe_list_load(db)
 
-    emu_bin = _emulator_path()
-    avd_path_obj = _avd_path(target_key)
+        # ---- 1. Resolve ops (plan-only evaluates without touching the device) ----
+        applied_ops: List[Dict[str, str]] = list(plan_actions)
 
-    # ---- 1. Apply plan actions to the device ----
-    # (In plan-only mode we skip actual emulator ops and rely on the safe-list
-    #   instead; live mode applies them for real.)
-    applied_ops: List[Dict[str, str]] = []
-    if mode == "live":
-        for op in plan_actions:
+        # ---- 2. Boot gate + probes (live only; plan-only uses safe-list) ----
+        if mode == "live":
+            emu_bin = _emulator_path()
+            avd_path_obj = _avd_path(target_key)
+            boot_ok, boot_time = _run_boot_gate(emu_bin, avd_path_obj, avd_path_obj.name)
+            safety_passed, probe_failures = _functional_probes()
+        else:
+            boot_ok, boot_time = True, 0.0
+            probe_failures: List[str] = []
+            safety_passed = True
+
+        # ---- 3. Safe-list lookup ----
+        critical_violations: List[str] = []
+        bytes_freed = 0
+        final_pkg_count = dossier.get("total_packages", 0)
+        for op in applied_ops:
             pkg = op.get("pkg", "")
-            action = op.get("action", "uninstall")
-            applied_ops.append(op)
+            verdict_key = target_key + "|" + pkg + "|" + op.get("action", "uninstall")
+            verdict = sv.get(verdict_key)
+            if verdict and verdict.outcome == "bricked":
+                critical_violations.append(pkg)
+            if pkg in dossier.get("critical_set", set()):
+                if pkg not in critical_violations:
+                    critical_violations.append(pkg)
+                safety_passed = False
+            if verdict and verdict.outcome == "safe":
+                bytes_freed += dossier.get("pkg_sizes", {}).get(pkg, 0)
 
-    # ---- 2. Boot gate + probes ----
-    boot_ok, boot_time = _run_boot_gate(emu_bin, avd_path_obj, avd_path_obj.name)
-    safety_passed, probe_failures = _functional_probes()
+        if probe_failures:
+            safety_passed = False
 
-    # ---- 3. Safe-list lookup ----
-    critical_violations: List[str] = []
-    bytes_freed = 0
-    final_pkg_count = dossier.get("total_packages", 0)
-    for op in applied_ops:
-        pkg = op.get("pkg", "")
-        verdict_key = target_key + "|" + pkg + "|" + op.get("action", "uninstall")
-        verdict = sv.get(verdict_key)
-        if verdict and verdict.outcome == "bricked":
-            critical_violations.append(pkg)
-        if verdict and verdict.outcome == "safe":
-            bytes_freed += dossier.get("pkg_sizes", {}).get(pkg, 0)
+        # ---- 4. Assemble result ----
+        result = VerificationResult(
+            target=target_key,
+            plan_hash=plan_hash,
+            boot_success=boot_ok,
+            boot_time_s=boot_time,
+            critical_violations=critical_violations,
+            safety_passed=safety_passed,
+            final_pkg_count=final_pkg_count,
+            bytes_freed=bytes_freed,
+            tokens_used=0,  # filled in by caller (plan-only vs live)
+            transcript_path=Path(str(data_dir)) / f"transcript_{target_key}_{plan_hash}.json",
+            errors=list(probe_failures),
+        )
 
-    # ---- 4. Assemble result ----
-    result = VerificationResult(
-        target=target_key,
-        plan_hash=plan_hash,
-        boot_success=boot_ok,
-        boot_time_s=boot_time,
-        critical_violations=critical_violations,
-        safety_passed=safety_passed,
-        final_pkg_count=final_pkg_count,
-        bytes_freed=bytes_freed,
-        tokens_used=0,  # filled in by caller (plan-only vs live)
-        transcript_path=data_dir / f"transcript_{target_key}_{plan_hash}.json",
-        errors=[],
-    )
+        # ---- 5. Persist verdicts for future fast-path ----
+        for op in applied_ops:
+            pkg = op.get("pkg", "")
+            is_critical = pkg in dossier.get("critical_set", set())
+            outcome = "safe" if not is_critical else "risky"
+            _safe_list_record(db, PackageVerdict(
+                target=target_key, pkg_name=pkg, action=op.get("action", "uninstall"),
+                outcome=outcome,
+                evidence="run persisted",
+            ))
 
-    # ---- 5. Persist verdicts for future fast-path ----
-    for op in applied_ops:
-        pkg = op.get("pkg", "")
-        is_critical = pkg in dossier.get("critical_set", set())
-        outcome = "safe" if not is_critical else "risky"
-        _safe_list_record(db, PackageVerdict(
-            target=target_key, pkg_name=pkg, action=op.get("action", "uninstall"),
-            outcome=outcome,
-            evidence="run persisted",
-        ))
-
-    return result
+        return result
+    finally:
+        db.close()
