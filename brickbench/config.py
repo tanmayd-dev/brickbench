@@ -3,7 +3,7 @@
 __version__ = "0.1.0"
 
 # Core providers + env config
-PROCESS_PROVIDERS = ["zen", "agy", "codex", "openrouter"]
+PROCESS_PROVIDERS = ["zen", "agy", "codex", "openrouter", "local"]
 PROCESS_MODES = {"plan_only", "live"}
 DEBLOAT_MODES = {"uninstall", "system"}
 
@@ -11,7 +11,6 @@ DEBLOAT_MODES = {"uninstall", "system"}
 DEFAULT_EMU_RAM_MB = 2048
 DEFAULT_EMU_SNAPSHOT = "clean_boot"
 EFFECTIVE_EMU_RAM_AVAILABLE_MB = 3840  # 7.1 GiB total minus browser + harness overhead
-EFFECTIVE_EMU_RAM_AVAILABLE_MB_QUERY = "SELECT value FROM pragma_table_info WHERE name='avail_mem'"  # placeholder
 
 # Package lists per target: common Android packages to probe during safe-list population.
 # The probe sweep iterates through these, recording (target, pkg, action) verdicts
@@ -74,4 +73,5 @@ RATE_LIMITS = {
     "agy": {"weekly_quota_notice": "weekly hard cap; weekly reset; ~250 req/5h unofficial"},
     "zen": {"best_effort": True, "transient_403_rate": "~1/12 runs"},
     "codex": {"rpm": None, "rpd": None},  # per OpenAI key; user-managed
+    "local": {"best_effort": True},  # Ollama-style local models; no API quota
 }
