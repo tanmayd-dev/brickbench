@@ -11,11 +11,13 @@ Responsibilities
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sqlite3
 import time
 import shutil
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from brickbench.config import RATE_LIMITS, DEFAULT_EMU_RAM_MB, DEBLOAT_MODES, PROCESS_MODES
@@ -228,6 +230,61 @@ def _functional_probes(timeout_s: int = 30) -> Tuple[bool, List[str]]:
 
 
 # ---------------------------------------------------------------------------
+# Probe / safe-list fast-path
+# ---------------------------------------------------------------------------
+
+def probe_package(
+    target_key: str,
+    pkg_name: str,
+    action: str,
+    dossier: Dict[str, Any],
+    data_dir: any,
+) -> PackageVerdict:
+    """Verify a single (target, package, action) triple and record the verdict.
+
+    Fast-path: if (target, pkg, action) is already in the safe-list, return
+    the cached verdict immediately (no emulator invocation).
+
+    Slow-path: otherwise invoke `verify_plan` with a minimal plan containing
+    just this one action; the evaluator will persist the verdict for future
+    fast-path hits.
+    """
+    import hashlib
+    from brickbench.evaluator import PackageVerdict, _safe_list_record, _sqlite_conn
+
+    db = _sqlite_conn(data_dir)
+    sv = _safe_list_load(db)
+    verdict_key = f"{target_key}|{pkg_name}|{action}"
+
+    # ---- Fast-path: already cached? ----
+    if verdict_key in sv:
+        return sv[verdict_key]
+
+    # ---- Slow-path: verify via the emulator ----
+    plan_hash = hashlib.sha256(
+        f"{target_key}:{pkg_name}:{action}".encode()).hexdigest()[:16]
+
+    verify_plan(
+        target_key=target_key,
+        plan_hash=plan_hash,
+        plan_actions=[{"pkg": pkg_name, "action": action}],
+        dossier=dossier,
+        model_id="probe",
+        prompt_variant="probe",
+        mode="live",
+        debloat_mode="uninstall",
+        data_dir=data_dir,
+    )
+
+    # Re-read the verdict that was just persisted
+    sv = _safe_list_load(db)
+    return sv.get(verdict_key, PackageVerdict(
+        target=target_key, pkg_name=pkg_name, action=action, outcome="risky",
+        evidence="probe sweep",
+    ))
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -291,7 +348,7 @@ def verify_plan(
         final_pkg_count=final_pkg_count,
         bytes_freed=bytes_freed,
         tokens_used=0,  # filled in by caller (plan-only vs live)
-        transcript_path=data_dir / "transcript_" + target_key + "_" + plan_hash + ".json",
+        transcript_path=data_dir / f"transcript_{target_key}_{plan_hash}.json",
         errors=[],
     )
 
