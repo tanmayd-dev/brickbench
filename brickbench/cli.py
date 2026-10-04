@@ -1,7 +1,6 @@
 """brickbench CLI — entry point wired by setuptools_scripts."""
 
-import sys
-from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import click
 
@@ -23,7 +22,7 @@ def cli():
 # CLI commands
 # ---------------------------------------------------------------------------
 
-@click.command("init")
+@cli.command("init")
 def init_cmd():
     """Scaffold the data directory and SQLite state store."""
     from pathlib import Path
@@ -35,10 +34,20 @@ def init_cmd():
     conn = sqlite3.connect(str(db_path))
     conn.executescript(
         """
+        CREATE TABLE IF NOT EXISTS verdicts (
+            target TEXT NOT NULL,
+            pkg_name TEXT NOT NULL,
+            action TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            evidence TEXT,
+            updated_at REAL DEFAULT (julianday('now')),
+            PRIMARY KEY (target, pkg_name, action)
+        );
         CREATE TABLE IF NOT EXISTS runs (
             run_id TEXT PRIMARY KEY,
             target TEXT NOT NULL,
             model_id TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'zen',
             prompt_variant TEXT NOT NULL,
             mode TEXT NOT NULL,
             debloat_mode TEXT NOT NULL,
@@ -54,12 +63,13 @@ def init_cmd():
     click.echo("Initialized brickbench state at " + str(base / "brickbench.db"))
 
 
-@click.command("resume")
+@cli.command("resume")
 def resume_cmd():
     """Scan for pending runs and execute one step.
 
     Call repeatedly until it reports 0 pending work.
     """
+    from pathlib import Path
     import sqlite3 as sq
     from brickbench.runner import Runner
 
@@ -69,7 +79,13 @@ def resume_cmd():
     conn = sq.connect(str(db_path))
     runner = Runner(data_dir=str(data_dir), max_emulator_concurrency=1)
     n = 0
-    while runner.step() == 0 and n < 100:
+    while n < 100:
+        pending = conn.execute(
+            "SELECT count(*) FROM runs WHERE status='pending'"
+        ).fetchone()[0]
+        if pending == 0:
+            break
+        runner.step()
         n += 1
     pending_count = conn.execute(
         "SELECT count(*) FROM runs WHERE status='pending'"
@@ -79,7 +95,7 @@ def resume_cmd():
     conn.close()
 
 
-@click.command("run")
+@cli.command("run")
 @click.option("--max-emulator", default=1, type=int, help="Max concurrent emulator instances.")
 @click.option("--max-llm", default=None, type=int, help="Max parallel LLM calls (per-provider quota).")
 @click.option("--providers", multiple=True, default=[], help="Provider tags to include (zen agy codex openrouter local).")
@@ -170,18 +186,6 @@ def run_command(
         click.echo("🧱 Enqueued " + str(total) + " matrix cells into data/runs/")
     finally:
         runner.close()
-
-
-# ---------------------------------------------------------------------------
-# Ensure commands are registered when the module is imported
-# ---------------------------------------------------------------------------
-
-# These must be added to the group before cli() is called.
-from brickbench.cli import init_cmd, resume_cmd, run_command  # noqa: F401  # bind names
-
-cli.add_command(init_cmd)
-cli.add_command(resume_cmd)
-cli.add_command(run_command)
 
 
 # ---------------------------------------------------------------------------
