@@ -6,6 +6,8 @@ import click
 
 from brickbench.config import __version__
 
+from tqdm import tqdm
+
 
 # ---------------------------------------------------------------------------
 # Click group
@@ -64,7 +66,9 @@ def init_cmd():
 
 
 @cli.command("resume")
-def resume_cmd():
+@click.option("--max-emulator", default=1, type=int, help="Max concurrent emulator instances (for live mode).")
+@click.option("--max-llm", default=None, type=int, help="Max parallel LLM calls.")
+def resume_cmd(max_emulator: int, max_llm: Optional[int]):
     """Scan for pending runs and execute one step.
 
     Call repeatedly until it reports 0 pending work.
@@ -77,20 +81,42 @@ def resume_cmd():
     data_dir.mkdir(parents=True, exist_ok=True)
     db_path = data_dir / "brickbench.db"
     conn = sq.connect(str(db_path))
-    runner = Runner(data_dir=str(data_dir), max_emulator_concurrency=1)
-    n = 0
-    while n < 100:
-        pending = conn.execute(
-            "SELECT count(*) FROM runs WHERE status='pending'"
-        ).fetchone()[0]
-        if pending == 0:
-            break
-        runner.step()
-        n += 1
-    pending_count = conn.execute(
+    runner = Runner(data_dir=str(data_dir), max_emulator_concurrency=max_emulator, llm_concurrency=max_llm)
+
+    # Get initial pending count
+    initial_pending = conn.execute(
         "SELECT count(*) FROM runs WHERE status='pending'"
     ).fetchone()[0]
-    click.echo("Executed " + str(n) + " step(s); pending runs left: " + str(pending_count))
+    click.echo(f"📋 Starting: {initial_pending} pending runs")
+
+    import concurrent.futures
+
+    n = 0
+    pending_count = initial_pending
+    workers = max(max_llm or 1, 1)  # At least 1 worker
+
+    with tqdm(total=initial_pending, desc="Resuming runs", unit="run",
+              bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
+        while n < 100 and pending_count > 0:
+            # Run up to `workers` step() calls in parallel
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(runner.step) for _ in range(workers)]
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        result = future.result()
+                        if result == 1:
+                            n += 1
+                            pbar.update(1)
+                        pending_count = conn.execute(
+                            "SELECT count(*) FROM runs WHERE status='pending'"
+                        ).fetchone()[0]
+                    except Exception as e:
+                        click.echo(f"Error in worker: {e}")
+
+            if pending_count == 0:
+                break
+
+    click.echo(f"\n✅ Done: {n} steps executed, {pending_count} pending runs left")
     runner.close()
     conn.close()
 
@@ -117,10 +143,38 @@ def run_command(
     This builds the Cartesian product of the given dimensions and runs each
     cell through the runner, persisting everything to the data dir.
     """
-    from brickbench.config import PROCESS_PROVIDERS
+    from brickbench.config import PROCESS_PROVIDERS, PROCESS_MODES, DEBLOAT_MODES, PACKAGES_PER_TARGET
 
     # Resolve target keys
+    # Normalize space-separated arguments when passed as a single string
+    def split_options(opts):
+        if isinstance(opts, tuple) and len(opts) == 1:
+            val = opts[0].strip()
+            if val.lower() == "all":
+                return None  # "all" means use defaults
+            return tuple(val.split())
+        return opts
+
+    targets = split_options(targets)
+    providers = split_options(providers)
+    modes = split_options(modes)
+    debloat_modes = split_options(debloat_modes)
+    prompt_variants = split_options(prompt_variants)
+    # Expand "all" to full lists
+    if targets is None:
+        targets = PACKAGES_PER_TARGET.keys()
+    if providers is None:
+        providers = PROCESS_PROVIDERS
+    if modes is None:
+        modes = PROCESS_MODES
+    if debloat_modes is None:
+        debloat_modes = DEBLOAT_MODES
+    if prompt_variants is None:
+        prompt_variants = ["baseline"]
+
+
     target_keys = list(targets) if targets else ["aosp-vanilla", "aosp-gapps", "aosp-play", "lineage-23.2", "e-os-gsi"]
+
 
     # Resolve model IDs per provider
     model_cfgs: Dict[str, List[str]] = {}
@@ -186,6 +240,98 @@ def run_command(
         click.echo("🧱 Enqueued " + str(total) + " matrix cells into data/runs/")
     finally:
         runner.close()
+
+
+
+@cli.command("reset")
+@click.option("--confirm", is_flag=True, default=False, help="Require confirmation before resetting")
+def reset_cmd(confirm: bool):
+    """Reset all brickbench results (discard all data)."""
+    from pathlib import Path
+    import sqlite3
+
+    base = Path("data/runs")
+    db_path = base / "brickbench.db"
+
+    if not confirm:
+        response = input("⚠️  WARNING: This will delete ALL brickbench results. Type 'yes' to confirm: ")
+        if response.lower() != "yes":
+            click.echo("Reset cancelled.")
+            return
+
+    if db_path.exists():
+        conn = sqlite3.connect(str(db_path))
+        conn.execute("DROP TABLE IF EXISTS runs")
+        conn.execute("DROP TABLE IF EXISTS verdicts")
+        conn.commit()
+        conn.close()
+        click.echo("✅ Reset complete. All results discarded.")
+    else:
+        click.echo("No brickbench database found at " + str(db_path))
+
+
+@cli.command("export")
+@click.option("--output", type=str, default="brickbench_export.json", required=False,
+              help="Output file path (default: brickbench_export.json)")
+@click.option("--format", type=click.Choice(["json", "csv"]), default="json", required=False,
+              help="Export format (default: json)")
+def export_cmd(output: str, format: str):
+    """Export brickbench results to a file (JSON or CSV)."""
+    from pathlib import Path
+    import sqlite3
+    import csv
+
+    base = Path("data/runs")
+    db_path = base / "brickbench.db"
+
+    if not db_path.exists():
+        click.echo("No brickbench database found at " + str(db_path))
+        return
+
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+
+    if format == "json":
+        cur = conn.execute("SELECT * FROM runs")
+        rows = [{k: row[k] for k in row.keys()} for row in cur]
+        import json
+        with open(output, "w") as f:
+            json.dump(rows, f, indent=2)
+        click.echo(f"✅ Exported {len(rows)} run records to {output}")
+    elif format == "csv":
+        cur = conn.execute("SELECT * FROM runs")
+        if cur.rowcount == 0:
+            click.echo("No run records to export.")
+            conn.close()
+            return
+
+        cols = [desc[0] for desc in cur.description]
+        with open(output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=cols)
+            writer.writeheader()
+            for row in cur:
+                writer.writerow({k: row[k] for k in row.keys()})
+        click.echo(f"✅ Exported {cur.rowcount} run records to {output}")
+
+    # Also export verdicts
+    cur = conn.execute("SELECT * FROM verdicts")
+    if format == "json":
+        rows = [{k: row[k] for k in row.keys()} for row in cur]
+        verdicts_output = output.replace(".json", "_verdicts.json")
+        with open(verdicts_output, "w") as f:
+            json.dump(rows, f, indent=2)
+        click.echo(f"✅ Exported {len(rows)} verdict records to {verdicts_output}")
+    elif format == "csv":
+        cols = [desc[0] for desc in cur.description]
+        verdicts_output = output.replace(".csv", "_verdicts.csv")
+        with open(verdicts_output, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=cols)
+            writer.writeheader()
+            for row in cur:
+                writer.writerow({k: row[k] for k in row.keys()})
+        click.echo(f"✅ Exported {cur.rowcount} verdict records to {verdicts_output}")
+
+    conn.close()
 
 
 # ---------------------------------------------------------------------------

@@ -201,9 +201,13 @@ class Runner:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.conn = _sqlite_conn(self.data_dir)
+        self.conn.isolation_level = None  # Autocommit mode
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA check_same_thread=False")
         self.max_emulator_concurrency = max_emulator_concurrency
         self.llm_concurrency = llm_concurrency or 1
         self._emu_semaphore = threading.Semaphore(max_emulator_concurrency)
+        self._db_lock = threading.RLock()
 
     def close(self) -> None:
         self.conn.close()
@@ -243,22 +247,32 @@ class Runner:
 
         Returns 1 if a run was executed, 0 when no pending work remains.
         """
-        pending = _get_pending_runs(self.conn, max_rows=5)
+        # Each step gets its own connection for thread safety
+        import sqlite3
+        from brickbench.runner import _get_pending_runs, _mark_running, _mark_done, _mark_failed_rate_limited
+
+        db_path = self.data_dir / "brickbench.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.row_factory = sqlite3.Row
+
+        pending = _get_pending_runs(conn, max_rows=5)
         if not pending:
+            conn.close()
             return 0
 
         run = pending[0]
-        _mark_running(self.conn, run["run_id"])
-        self.conn.commit()
+        _mark_running(conn, run["run_id"])
+        conn.commit()
 
         try:
-            self._execute_one(run)
+            self._execute_one(run, conn)
         except RuntimeError:
-            _mark_failed_rate_limited(self.conn, run["run_id"])
+            _mark_failed_rate_limited(conn, run["run_id"])
         except Exception:
-            _mark_done(self.conn, run["run_id"], "")
+            _mark_done(conn, run["run_id"], "")
         finally:
-            self.conn.commit()
+            conn.commit()
+            conn.close()
 
         return 1
 
@@ -326,7 +340,7 @@ class Runner:
     # ------------------------------------------------------------------
     # Core execution for one run
     # ------------------------------------------------------------------
-    def _execute_one(self, run: dict) -> None:
+    def _execute_one(self, run: dict, conn: sqlite3.Connection) -> None:
         """Dispatch one run to the appropriate provider + mode path."""
         target_key = run["target"]
         model_id = run["model_id"]
@@ -339,18 +353,18 @@ class Runner:
         if provider == "openrouter" or "/" in model_id:
             # In a real setup the api_key comes from env/.env.
             # Here we simply skip OR until the user supplies it.
-            _mark_failed_rate_limited(self.conn, run["run_id"])
+            _mark_failed_rate_limited(conn, run["run_id"])
             return
 
         # ---- 2. Emulator serial acquire (plan-only skips) ----
         if mode != "plan_only":
             self._emu_semaphore.acquire()
             try:
-                self._emu_execute(run)
+                self._emu_execute(run, conn)
             finally:
                 self._emu_semaphore.release()
         else:
-            self._plan_only_execute(run)
+            self._plan_only_execute(run, conn)
 
         # ---- 5. Persist result hash ----
         import hashlib
@@ -362,12 +376,12 @@ class Runner:
         result_hash = hashlib.sha256(
             f"{run['target']}:{plan_hash}:{run['mode']}:{run['debloat_mode']}".encode()
         ).hexdigest()
-        _mark_done(self.conn, run["run_id"], result_hash)
+        _mark_done(conn, run["run_id"], result_hash)
 
     # ------------------------------------------------------------------
     # Plan-only path
     # ------------------------------------------------------------------
-    def _plan_only_execute(self, run: dict) -> None:
+    def _plan_only_execute(self, run: dict, conn: sqlite3.Connection) -> None:
         """Execute a plan-only cell: evaluator verifies, safe-list updates."""
         from brickbench.evaluator import verify_plan
 
@@ -399,7 +413,7 @@ class Runner:
     # ------------------------------------------------------------------
     # Live path (emulator)
     # ------------------------------------------------------------------
-    def _emu_execute(self, run: dict) -> None:
+    def _emu_execute(self, run: dict, conn: sqlite3.Connection) -> None:
         """Execute a live cell against the emulator."""
         from brickbench.evaluator import verify_plan
 
