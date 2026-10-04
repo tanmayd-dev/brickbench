@@ -94,8 +94,9 @@ def _upsert_run(conn: sqlite3.Connection, run: dict) -> None:
         """,
         {k: run[k] for k in [
             "run_id", "target", "model_id", "prompt_variant", "mode", "debloat_mode",
-            "plan_hash", "result_hash", "status", "created_at", "updated_at"
+            "provider", "plan_hash", "result_hash", "status", "created_at", "updated_at", "provider"
         ] if k in run},
+
     )
     conn.commit()
 
@@ -213,11 +214,12 @@ class Runner:
     # ------------------------------------------------------------------
     # Public: enqueue a matrix cell
     # ------------------------------------------------------------------
-    def enqueue(self, *, target_key: str, model_id: str, prompt_variant: str, mode: str, debloat_mode: str) -> str:
+    def enqueue(self, *, target_key: str, model_id: str, prompt_variant: str, mode: str, debloat_mode: str, provider: str = "zen") -> str:
         """Enqueue a new run cell and return its run_id."""
         run_id = str(uuid.uuid4())
         run = {
             "run_id": run_id,
+            "provider": provider,
             "target": target_key,
             "model_id": model_id,
             "prompt_variant": prompt_variant,
@@ -230,7 +232,7 @@ class Runner:
             "updated_at": None,
         }
         allowed = ["run_id", "target", "model_id", "prompt_variant", "mode", "debloat_mode",
-                   "plan_hash", "result_hash", "status", "created_at", "updated_at"]
+                   "plan_hash", "result_hash", "status", "created_at", "updated_at", "provider"]
         filtered = {k: run[k] for k in allowed if k in run}
         _upsert_run(self.conn, filtered)
         self.conn.commit()
@@ -261,7 +263,68 @@ class Runner:
         return 0
 
     # ------------------------------------------------------------------
-    # Core execution for one run
+    
+    # ------------------------------------------------------------------
+    # Probe sweep: incrementally populate the safe-list per target
+    # ------------------------------------------------------------------
+    def probe_sweep(self, packages_per_target: Optional[Dict[str, List[str]]] = None,
+                    per_target: int = 20) -> Dict[str, int]:
+        """Incrementally populate the safe-list by verifying packages per target.
+
+        For each target, examines up to  packages that are not yet
+        recorded in the safe-list and verifies them via the evaluator's probe_package
+        function.  Fast-path verdicts (already in the safe-list) cost essentially
+        zero time; slow-path verdicts require an emulator run (~30–90 s the first
+        time, then cached).
+
+        Returns a dict summarising how many verdicts were fast-path vs slow-path
+        per target.
+        """
+        from brickbench.config import PACKAGES_PER_TARGET as _DEFAULT_PPT
+        from brickbench.evaluator import probe_package
+
+        ppt = packages_per_target or _DEFAULT_PPT
+        summary: Dict[str, int] = {"fast": 0, "slow": 0}
+
+        for target_key, pkg_list in ppt.items():
+            verified = 0
+            fast = 0
+            slow = 0
+            for pkg_name in pkg_list:
+                if verified >= per_target:
+                    break
+                # Check if already in safe-list (fast-path)
+                import sqlite3 as sq
+                conn = sqlite3.connect(str(self.data_dir / "brickbench.db"))
+                cur = conn.execute(
+                    "SELECT outcome FROM verdicts WHERE target=? AND pkg_name=? AND action=?",
+                    (target_key, pkg_name, "uninstall"),
+                )
+                row = cur.fetchone()
+                conn.close()
+                if row is not None:
+                    fast += 1
+                    summary["fast"] += 1
+                else:
+                    # Slow-path: verify via emulator and record verdict
+                    dossier = {
+                        "total_packages": 130,
+                        "critical_set": {"com.android.systemui", "com.android.phone"},
+                        "pkg_sizes": {},
+                    }
+                    vp = probe_package(target_key=target_key,
+                                       pkg_name=pkg_name,
+                                       action="uninstall",
+                                       dossier=dossier,
+                                       data_dir=self.data_dir)
+                    slow += 1
+                    summary["slow"] += 1
+                verified += 1
+            summary[f"verified_{target_key}"] = verified
+            # Cap per-target total to keep the sweep moving quickly
+            summary[f"fast_{target_key}"] = fast
+            summary[f"slow_{target_key}"] = slow
+        return summary# Core execution for one run
     # ------------------------------------------------------------------
     def _execute_one(self, run: dict) -> None:
         """Dispatch one run to the appropriate provider + mode path."""
