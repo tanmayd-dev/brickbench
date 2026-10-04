@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtualenv
+venv/
+.venv/
+
+# Runtime state (rebuilt via `brickbench init` / runs)
+data/runs/*.db
+data/runs/*.db-wal
+data/runs/*.db-shm
+data/runs/transcript_*.json
+data/exports/
+
+# Secrets / local config
+.env
+.env.local
+
+# OS / editor
+.DS_Store
+*.swp
+.vscode/
+.idea/
