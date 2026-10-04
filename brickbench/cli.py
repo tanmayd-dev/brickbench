@@ -20,10 +20,10 @@ def cli():
 
 
 # ---------------------------------------------------------------------------
-# CLI commands — direct subcommands of `cli`
+# CLI commands
 # ---------------------------------------------------------------------------
 
-@cli.command("init")
+@click.command("init")
 def init_cmd():
     """Scaffold the data directory and SQLite state store."""
     from pathlib import Path
@@ -54,7 +54,7 @@ def init_cmd():
     click.echo("Initialized brickbench state at " + str(base / "brickbench.db"))
 
 
-@cli.command("resume")
+@click.command("resume")
 def resume_cmd():
     """Scan for pending runs and execute one step.
 
@@ -79,10 +79,10 @@ def resume_cmd():
     conn.close()
 
 
-@cli.command("run")
+@click.command("run")
 @click.option("--max-emulator", default=1, type=int, help="Max concurrent emulator instances.")
 @click.option("--max-llm", default=None, type=int, help="Max parallel LLM calls (per-provider quota).")
-@click.option("--providers", multiple=True, default=[], help="Provider tags to include (zen agy codex openrouter).")
+@click.option("--providers", multiple=True, default=[], help="Provider tags to include (zen agy codex openrouter local).")
 @click.option("--targets", multiple=True, default=[], help="Target tags to include.")
 @click.option("--modes", multiple=True, default=["plan_only", "live"], help="Eval modes.")
 @click.option("--debloat-modes", multiple=True, default=["uninstall"], help="Debloat mode(s).")
@@ -137,6 +137,10 @@ def run_command(
                 "inclusionai/ling-3.0-flash-sante:free", "liquid/lfm-2.5-2.6b:free",
                 "apodex/apodex-1.1-mini:free", "nvidia/nemotron-3.5-content-safety:free",
             ]
+        elif p == "local":
+            model_cfgs["local"] = [
+                "qwen3:4b", "phi4-mini:3.8b", "llama3.2:3b", "gemma3:4b",
+            ]
         else:
             continue
 
@@ -152,17 +156,32 @@ def run_command(
                     for mode in modes:
                         for dmode in debloat_modes:
                             for pv in prompt_variants:
+                                # Determine the provider tag for this model_id
+                                provider_tag = pid  # the tag is the provider name
                                 rid = runner.enqueue(
                                     target_key=tk,
                                     model_id=mid,
                                     prompt_variant=pv,
                                     mode=mode,
                                     debloat_mode=dmode,
+                                    provider=provider_tag,
                                 )
                                 total += 1
         click.echo("🧱 Enqueued " + str(total) + " matrix cells into data/runs/")
     finally:
         runner.close()
+
+
+# ---------------------------------------------------------------------------
+# Ensure commands are registered when the module is imported
+# ---------------------------------------------------------------------------
+
+# These must be added to the group before cli() is called.
+from brickbench.cli import init_cmd, resume_cmd, run_command  # noqa: F401  # bind names
+
+cli.add_command(init_cmd)
+cli.add_command(resume_cmd)
+cli.add_command(run_command)
 
 
 # ---------------------------------------------------------------------------
