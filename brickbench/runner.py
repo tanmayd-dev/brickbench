@@ -15,17 +15,13 @@ Design goals
 
 from __future__ import annotations
 
-import json
-import subprocess
 import sqlite3
-import time
 import threading
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-from brickbench.config import RATE_LIMITS, DEBLOAT_MODES, PROCESS_MODES
-from brickbench.evaluator import verify_plan, PackageVerdict, VerificationResult
+from brickbench.evaluator import verify_plan
 
 # ---------------------------------------------------------------------------
 # SQLite state store helpers
@@ -51,6 +47,7 @@ def _sqlite_conn(data_dir: any) -> sqlite3.Connection:
             run_id TEXT PRIMARY KEY,
             target TEXT NOT NULL,
             model_id TEXT NOT NULL,
+            provider TEXT NOT NULL DEFAULT 'zen',
             prompt_variant TEXT NOT NULL,
             mode TEXT NOT NULL,
             debloat_mode TEXT NOT NULL,
@@ -62,28 +59,28 @@ def _sqlite_conn(data_dir: any) -> sqlite3.Connection:
         );
         """
     )
+    # Migrate pre-provider databases.
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+        if "provider" not in cols:
+            conn.execute("ALTER TABLE runs ADD COLUMN provider TEXT NOT NULL DEFAULT 'zen'")
+            conn.commit()
+    except sqlite3.OperationalError:
+        pass
     return conn
-
-
-def _row_to_dict(r: Any) -> dict:
-    """Convert a sqlite3.Row (or tuple) to a dict by column name."""
-    if isinstance(r, sqlite3.Row):
-        return {c.name: r[c.name] for c in r.keys()}
-    # fallback: assume r is a tuple, use column names from description
-    # (called from _get_pending_runs where we don't set row_factory)
-    return {}
 
 
 def _upsert_run(conn: sqlite3.Connection, run: dict) -> None:
     conn.execute(
         """
-        INSERT INTO runs (run_id, target, model_id, prompt_variant, mode, debloat_mode,
+        INSERT INTO runs (run_id, target, model_id, provider, prompt_variant, mode, debloat_mode,
                           plan_hash, result_hash, status, created_at, updated_at)
-        VALUES (:run_id, :target, :model_id, :prompt_variant, :mode, :debloat_mode,
+        VALUES (:run_id, :target, :model_id, :provider, :prompt_variant, :mode, :debloat_mode,
                 :plan_hash, :result_hash, :status, :created_at, :updated_at)
         ON CONFLICT(run_id) DO UPDATE SET
             target=excluded.target,
             model_id=excluded.model_id,
+            provider=excluded.provider,
             prompt_variant=excluded.prompt_variant,
             mode=excluded.mode,
             debloat_mode=excluded.debloat_mode,
@@ -93,8 +90,8 @@ def _upsert_run(conn: sqlite3.Connection, run: dict) -> None:
             updated_at=julianday('now')
         """,
         {k: run[k] for k in [
-            "run_id", "target", "model_id", "prompt_variant", "mode", "debloat_mode",
-            "provider", "plan_hash", "result_hash", "status", "created_at", "updated_at", "provider"
+            "run_id", "target", "model_id", "provider", "prompt_variant", "mode", "debloat_mode",
+            "plan_hash", "result_hash", "status", "created_at", "updated_at",
         ] if k in run},
 
     )
@@ -103,7 +100,7 @@ def _upsert_run(conn: sqlite3.Connection, run: dict) -> None:
 
 def _get_pending_runs(conn: sqlite3.Connection, max_rows: int = 10) -> List[dict]:
     cur = conn.execute(
-        "SELECT run_id, target, model_id, prompt_variant, mode, debloat_mode, plan_hash "
+        "SELECT run_id, target, model_id, provider, prompt_variant, mode, debloat_mode, plan_hash "
         "FROM runs WHERE status='pending' ORDER BY created_at LIMIT ?",
         (max_rows,),
     )
@@ -200,7 +197,7 @@ class Runner:
         provider quotas.
     """
 
-    def __init__(self, data_dir: Path, max_emulator_concurrency: int = 1, llm_concurrency: Optional[int] = None):
+    def __init__(self, data_dir: Path | str, max_emulator_concurrency: int = 1, llm_concurrency: Optional[int] = None):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.conn = _sqlite_conn(self.data_dir)
@@ -242,7 +239,10 @@ class Runner:
     # Public: one iteration of the worker loop
     # ------------------------------------------------------------------
     def step(self) -> int:
-        """Pick one pending run, execute it (or defer), update state, return 0."""
+        """Pick one pending run, execute it (or defer), update state.
+
+        Returns 1 if a run was executed, 0 when no pending work remains.
+        """
         pending = _get_pending_runs(self.conn, max_rows=5)
         if not pending:
             return 0
@@ -253,17 +253,15 @@ class Runner:
 
         try:
             self._execute_one(run)
-        except RuntimeError as e:
+        except RuntimeError:
             _mark_failed_rate_limited(self.conn, run["run_id"])
-        except Exception as e:
+        except Exception:
             _mark_done(self.conn, run["run_id"], "")
         finally:
             self.conn.commit()
 
-        return 0
+        return 1
 
-    # ------------------------------------------------------------------
-    
     # ------------------------------------------------------------------
     # Probe sweep: incrementally populate the safe-list per target
     # ------------------------------------------------------------------
@@ -271,11 +269,11 @@ class Runner:
                     per_target: int = 20) -> Dict[str, int]:
         """Incrementally populate the safe-list by verifying packages per target.
 
-        For each target, examines up to  packages that are not yet
+        For each target, examines up to per_target packages that are not yet
         recorded in the safe-list and verifies them via the evaluator's probe_package
-        function.  Fast-path verdicts (already in the safe-list) cost essentially
-        zero time; slow-path verdicts require an emulator run (~30–90 s the first
-        time, then cached).
+        function. Fast-path verdicts (already in the safe-list) cost essentially
+        zero time; slow-path verdicts require an emulator run the first time,
+        then hit the cache.
 
         Returns a dict summarising how many verdicts were fast-path vs slow-path
         per target.
@@ -286,45 +284,47 @@ class Runner:
         ppt = packages_per_target or _DEFAULT_PPT
         summary: Dict[str, int] = {"fast": 0, "slow": 0}
 
-        for target_key, pkg_list in ppt.items():
-            verified = 0
-            fast = 0
-            slow = 0
-            for pkg_name in pkg_list:
-                if verified >= per_target:
-                    break
-                # Check if already in safe-list (fast-path)
-                import sqlite3 as sq
-                conn = sqlite3.connect(str(self.data_dir / "brickbench.db"))
-                cur = conn.execute(
-                    "SELECT outcome FROM verdicts WHERE target=? AND pkg_name=? AND action=?",
-                    (target_key, pkg_name, "uninstall"),
-                )
-                row = cur.fetchone()
-                conn.close()
-                if row is not None:
-                    fast += 1
-                    summary["fast"] += 1
-                else:
-                    # Slow-path: verify via emulator and record verdict
-                    dossier = {
-                        "total_packages": 130,
-                        "critical_set": {"com.android.systemui", "com.android.phone"},
-                        "pkg_sizes": {},
-                    }
-                    vp = probe_package(target_key=target_key,
-                                       pkg_name=pkg_name,
-                                       action="uninstall",
-                                       dossier=dossier,
-                                       data_dir=self.data_dir)
-                    slow += 1
-                    summary["slow"] += 1
-                verified += 1
-            summary[f"verified_{target_key}"] = verified
-            # Cap per-target total to keep the sweep moving quickly
-            summary[f"fast_{target_key}"] = fast
-            summary[f"slow_{target_key}"] = slow
-        return summary# Core execution for one run
+        conn = sqlite3.connect(str(self.data_dir / "brickbench.db"))
+        try:
+            for target_key, pkg_list in ppt.items():
+                verified = 0
+                fast = 0
+                slow = 0
+                for pkg_name in pkg_list:
+                    if verified >= per_target:
+                        break
+                    cur = conn.execute(
+                        "SELECT outcome FROM verdicts WHERE target=? AND pkg_name=? AND action=?",
+                        (target_key, pkg_name, "uninstall"),
+                    )
+                    if cur.fetchone() is not None:
+                        fast += 1
+                        summary["fast"] += 1
+                    else:
+                        dossier = {
+                            "total_packages": 130,
+                            "critical_set": {"com.android.systemui", "com.android.phone"},
+                            "pkg_sizes": {},
+                        }
+                        probe_package(
+                            target_key=target_key,
+                            pkg_name=pkg_name,
+                            action="uninstall",
+                            dossier=dossier,
+                            data_dir=self.data_dir,
+                        )
+                        slow += 1
+                        summary["slow"] += 1
+                    verified += 1
+                summary[f"verified_{target_key}"] = verified
+                summary[f"fast_{target_key}"] = fast
+                summary[f"slow_{target_key}"] = slow
+        finally:
+            conn.close()
+        return summary
+
+    # ------------------------------------------------------------------
+    # Core execution for one run
     # ------------------------------------------------------------------
     def _execute_one(self, run: dict) -> None:
         """Dispatch one run to the appropriate provider + mode path."""
@@ -333,16 +333,16 @@ class Runner:
         prompt_variant = run["prompt_variant"]
         mode = run["mode"]  # plan_only | live
         debloat_mode = run["debloat_mode"]  # uninstall | system
+        provider = run.get("provider", "zen")
 
         # ---- 1. Provider quota gate (OR only) ----
-        if model_id.startswith("openrouter/"):
+        if provider == "openrouter" or "/" in model_id:
             # In a real setup the api_key comes from env/.env.
             # Here we simply skip OR until the user supplies it.
             _mark_failed_rate_limited(self.conn, run["run_id"])
             return
 
         # ---- 2. Emulator serial acquire (plan-only skips) ----
-        import threading
         if mode != "plan_only":
             self._emu_semaphore.acquire()
             try:
