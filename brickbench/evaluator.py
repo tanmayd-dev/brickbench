@@ -103,32 +103,156 @@ def _safe_list_record(conn: sqlite3.Connection, v: PackageVerdict) -> None:
 # Emulator / QEMU bootstrap
 # ---------------------------------------------------------------------------
 
+def _sdk_root() -> Optional[str]:
+    """Locate the Android SDK root (must contain system-images)."""
+    import os
+    for env in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        root = os.environ.get(env)
+        if root and Path(root, "system-images").exists():
+            return root
+    for c in (
+        Path.home() / ".local/share/brickbench/android-sdk",
+        Path("/opt/android-sdk"),
+        Path.home() / "Android/Sdk",
+    ):
+        if (c / "system-images").exists():
+            return str(c)
+    return os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+
+
 def _emulator_path() -> Path:
-    """Return the qemu-system-x86_64 binary if found."""
+    """Return the Android `emulator` binary (the AVD wrapper, not raw qemu)."""
     import shutil
-    p = shutil.which("qemu-system-x86_64")
-    if not p:
-        raise RuntimeError("qemu-system-x86_64 not on PATH — install qemu-system-x86")
-    return Path(p)
+    root = _sdk_root()
+    if root:
+        cand = Path(root) / "emulator" / "emulator"
+        if cand.exists():
+            return cand
+    p = shutil.which("emulator")
+    if p:
+        return Path(p)
+    for c in (
+        Path("/opt/android-sdk/emulator/emulator"),
+        Path("~/Android/Sdk/emulator/emulator").expanduser(),
+    ):
+        if c.exists():
+            return c
+    raise RuntimeError(
+        "Android `emulator` binary not found — install the SDK emulator "
+        "or set ANDROID_SDK_ROOT"
+    )
+
+
+def _avd_name(target_key: str) -> str:
+    """Map a matrix target to a real AVD name.
+
+    Only `bb_aosp36` exists on this machine, so every target boots it
+    (override with BRICKBENCH_AVD). The requested target is still recorded
+    in verdicts/transcripts so per-target AVDs can be split out later.
+    """
+    import os
+    forced = os.environ.get("BRICKBENCH_AVD")
+    if forced:
+        return forced
+    return "bb_aosp36"
 
 
 def _avd_path(target_key: str) -> Path:
-    """Map a target key to an AVD name + path."""
-    mapping = {
-        "aosp-vanilla": "aosp_vanilla",
-        "aosp-gapps": "aosp_gapps",
-        "aosp-play": "aosp_play",
-        "lineage-23.2": "lineage_23_2",
-        "e-os-gsi": "eos_gsi",
-        "oem-combined": "oem_combined",
-    }
-    avd_name = mapping.get(target_key, target_key)
-    return Path("~/.android/avd/" + avd_name + ".avd").expanduser()
+    """Back-compat shim: local dir of the AVD backing `target_key`."""
+    return Path("~/.android/avd/" + _avd_name(target_key) + ".avd").expanduser()
+
+
+def _adb_serial(adb_port: int) -> str:
+    return f"emulator-{adb_port}"
 
 
 # ---------------------------------------------------------------------------
 # Verifier suite (boot gate + functional probes)
 # ---------------------------------------------------------------------------
+
+def _boot_emulator(
+    emulator_bin: Path,
+    avd_name: str,
+    adb_port: int = 5554,
+    snapshot: str = "clean_boot",
+    ram_mb: int = 2048,
+    timeout_s: int = 180,
+    log_path: Optional[Path] = None,
+):
+    """Boot an AVD snapshot in the background and wait for boot_completed.
+
+    Launches `emulator -avd <name>` via Popen (non-blocking) on its own
+    adb port pair, then polls `adb -s <serial> shell getprop
+    sys.boot_completed` until `timeout_s`.
+
+    Returns (proc, serial, boot_ok, boot_time_s). The caller owns `proc`
+    and must call `_stop_emulator(proc, serial)` in a finally block —
+    otherwise emulator processes accumulate and eat ~2 GB RAM each.
+    """
+    import subprocess
+    import time as _time
+
+    serial = _adb_serial(adb_port)
+    cmd = [
+        str(emulator_bin),
+        "-avd", avd_name,
+        "-snapshot", snapshot,
+        "-no-window",
+        "-no-audio",
+        "-no-boot-anim",
+        "-gpu", "swiftshader_indirect",
+        "-memory", str(ram_mb),
+        "-port", str(adb_port),
+        "-read-only",
+    ]
+    logf = open(str(log_path), "ab") if log_path else subprocess.DEVNULL
+    import os as _os
+    env = dict(_os.environ)
+    sdk = _sdk_root()
+    if sdk:
+        env.setdefault("ANDROID_SDK_ROOT", sdk)
+        env.setdefault("ANDROID_HOME", sdk)
+    try:
+        proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
+    finally:
+        if log_path:
+            logf.close()
+    start = _time.time()
+    boot_ok, boot_time = False, 0.0
+    while _time.time() - start < timeout_s:
+        if proc.poll() is not None:
+            break  # emulator died at startup (bad AVD/snapshot?)
+        try:
+            r = subprocess.run(
+                ["adb", "-s", serial, "shell", "getprop", "sys.boot_completed"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.stdout.strip() == "1":
+                boot_ok, boot_time = True, _time.time() - start
+                break
+        except Exception:
+            pass
+        _time.sleep(3)
+    if not boot_ok:
+        boot_time = _time.time() - start
+    return proc, serial, boot_ok, boot_time
+
+
+def _stop_emulator(proc, serial: str) -> None:
+    """Kill one emulator instance launched by `_boot_emulator`."""
+    import subprocess
+    try:
+        subprocess.run(["adb", "-s", serial, "emu", "kill"], capture_output=True, timeout=15)
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=20)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
 
 def _run_boot_gate(
     emulator_bin: Path,
@@ -137,46 +261,26 @@ def _run_boot_gate(
     ram_mb: int = 2048,
     timeout_s: int = 90,
 ) -> Tuple[bool, float]:
-    """Restore snapshot → wait for sys.boot_completed → return (ok, boot_time)."""
-    import time as _time
-    start = _time.time()
-    # 1. snapshot restore
-    subprocess.run(
-        [
-            str(emulator_bin),
-            "-avd", str(avd_path),
-            "-no-window",
-            "-no-audio",
-            "-no-boot-anim",
-            "-gpu", "swiftshader_indirect",
-            "-memory", str(ram_mb),
-            "-snapshot", "clean_boot",
-            "-port", "5554",
-        ],
-        capture_output=True,
-        text=True,
+    """Back-compat wrapper: boot the shared AVD, wait, then tear down.
+
+    Prefer `_boot_emulator`/`_stop_emulator` for concurrent workers with
+    distinct adb ports.
+    """
+    avd_name = _avd_name(avd_avd_name)
+    proc, serial, ok, bt = _boot_emulator(
+        emulator_bin, avd_name, adb_port=5554, ram_mb=ram_mb, timeout_s=timeout_s,
     )
-    # 2. poll boot_completed via adb
-    deadline = start + timeout_s
-    boot_time = 0.0
-    while _time.time() < deadline:
-        try:
-            r = subprocess.run(
-                ["adb", "shell", "getprop", "sys.boot_completed"],
-                capture_output=True, text=True, timeout=3,
-            )
-            out = r.stdout.strip()
-            if out == "1":
-                boot_time = _time.time() - start
-                return True, boot_time
-        except Exception:
-            pass
-        _time.sleep(1)
-    return False, _time.time() - start
+    try:
+        return ok, bt
+    finally:
+        _stop_emulator(proc, serial)
 
 
-def _functional_probes(timeout_s: int = 30) -> Tuple[bool, List[str]]:
-    """Run the lightweight functional probe suite.
+def _functional_probes(serial: Optional[str] = None, timeout_s: int = 30) -> Tuple[bool, List[str]]:
+    """Run the lightweight functional probe suite against one emulator.
+
+    `serial` selects the device (`adb -s <serial>`); None targets the
+    default device (single-emulator setups).
 
     Probes (all must pass for safety_passed=True):
       - `pm list packages` succeeds (non-zero exit)
@@ -187,35 +291,32 @@ def _functional_probes(timeout_s: int = 30) -> Tuple[bool, List[str]]:
     """
     failures: List[str] = []
 
+    def _adb(*args: str):
+        base = ["adb"]
+        if serial:
+            base += ["-s", serial]
+        return subprocess.run(base + list(args), capture_output=True, text=True, timeout=timeout_s)
+
     # 1. pm list packages
-    r = subprocess.run(["adb", "shell", "pm", "list", "packages"], capture_output=True, text=True, timeout=timeout_s)
+    r = _adb("shell", "pm", "list", "packages")
     if r.returncode != 0:
         failures.append("pm list packages failed")
 
     # 2. dumpsys package for a known system package
-    r = subprocess.run(
-        ["adb", "shell", "dumpsys", "package", "com.android.settings"],
-        capture_output=True, text=True, timeout=timeout_s,
-    )
+    r = _adb("shell", "dumpsys", "package", "com.android.settings")
     if r.returncode != 0:
         failures.append("dumpsys package failed")
 
     # 3. service check (no crash)
-    r = subprocess.run(
-        ["adb", "shell", "service", "check", "package"],
-        capture_output=True, text=True, timeout=timeout_s,
-    )
+    r = _adb("shell", "service", "check", "package")
     if r.returncode != 0:
         failures.append("service check failed")
 
     # 4. launcher intent resolves
-    r = subprocess.run(
-        [
-            "adb", "shell", "am", "start",
-            "-a", "android.intent.action.MAIN",
-            "-c", "android.intent.category.LAUNCHER",
-        ],
-        capture_output=True, text=True, timeout=timeout_s,
+    r = _adb(
+        "shell", "am", "start",
+        "-a", "android.intent.action.MAIN",
+        "-c", "android.intent.category.LAUNCHER",
     )
     if r.returncode != 0:
         failures.append("launcher intent resolve failed")
@@ -295,12 +396,27 @@ def verify_plan(
     mode: str,  # "plan_only" | "live"
     debloat_mode: str,  # "uninstall" | "system"
     data_dir: any,
+    adb_port: int = 5554,
+    emu_snapshot: str = "clean_boot",
+    emu_ram_mb: int = 2048,
+    emu_timeout_s: int = 180,
+    tokens_used: int = 0,
+    llm_reply: str = "",
+    plan_source: str = "heuristic",
 ) -> VerificationResult:
     """Execute one full verification cycle and return the result.
 
-    This is the core of the emulator-bound cost. All callers must be ready
-    for 30–90 s of wall time per unique (target, plan) pair.
+    Live mode boots a real emulator snapshot on `adb_port`, runs the
+    probes against that serial, and tears the instance down in a finally
+    block. Plan-only mode evaluates against the safe-list (no device).
+    A JSON transcript is written to the data dir for every run.
     """
+    import json as _json
+    import os as _os
+    import time as _time
+
+    emu_ram_mb = int(_os.environ.get("BRICKBENCH_EMU_RAM_MB", emu_ram_mb))
+    emu_snapshot = _os.environ.get("BRICKBENCH_SNAPSHOT", emu_snapshot)
     db = _sqlite_conn(data_dir)
     try:
         sv = _safe_list_load(db)
@@ -311,9 +427,19 @@ def verify_plan(
         # ---- 2. Boot gate + probes (live only; plan-only uses safe-list) ----
         if mode == "live":
             emu_bin = _emulator_path()
-            avd_path_obj = _avd_path(target_key)
-            boot_ok, boot_time = _run_boot_gate(emu_bin, avd_path_obj, avd_path_obj.name)
-            safety_passed, probe_failures = _functional_probes()
+            avd_name = _avd_name(target_key)
+            log_path = Path(str(data_dir)) / f"emu_{avd_name}_{adb_port}.log"
+            proc, serial, boot_ok, boot_time = _boot_emulator(
+                emu_bin, avd_name, adb_port=adb_port, snapshot=emu_snapshot,
+                ram_mb=emu_ram_mb, timeout_s=emu_timeout_s, log_path=log_path,
+            )
+            try:
+                if boot_ok:
+                    safety_passed, probe_failures = _functional_probes(serial)
+                else:
+                    safety_passed, probe_failures = False, ["boot gate failed"]
+            finally:
+                _stop_emulator(proc, serial)
         else:
             boot_ok, boot_time = True, 0.0
             probe_failures: List[str] = []
@@ -340,6 +466,7 @@ def verify_plan(
             safety_passed = False
 
         # ---- 4. Assemble result ----
+        transcript_path = Path(str(data_dir)) / f"transcript_{target_key}_{plan_hash}.json"
         result = VerificationResult(
             target=target_key,
             plan_hash=plan_hash,
@@ -349,10 +476,41 @@ def verify_plan(
             safety_passed=safety_passed,
             final_pkg_count=final_pkg_count,
             bytes_freed=bytes_freed,
-            tokens_used=0,  # filled in by caller (plan-only vs live)
-            transcript_path=Path(str(data_dir)) / f"transcript_{target_key}_{plan_hash}.json",
+            tokens_used=tokens_used,
+            transcript_path=transcript_path,
             errors=list(probe_failures),
         )
+
+        # ---- 4b. Write transcript (evidence that work happened) ----
+        try:
+            transcript_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(transcript_path, "w") as _f:
+                _json.dump({
+                    "target": target_key,
+                    "avd": _avd_name(target_key) if mode == "live" else None,
+                    "adb_port": adb_port if mode == "live" else None,
+                    "model_id": model_id,
+                    "prompt_variant": prompt_variant,
+                    "mode": mode,
+                    "debloat_mode": debloat_mode,
+                    "plan_hash": plan_hash,
+                    "plan_source": plan_source,
+                    "plan_actions": applied_ops,
+                    "llm_reply": llm_reply[:4000] if llm_reply else "",
+                    "result": {
+                        "boot_success": boot_ok,
+                        "boot_time_s": boot_time,
+                        "critical_violations": critical_violations,
+                        "safety_passed": safety_passed,
+                        "final_pkg_count": final_pkg_count,
+                        "bytes_freed": bytes_freed,
+                        "tokens_used": tokens_used,
+                        "errors": list(probe_failures),
+                    },
+                    "recorded_at": _time.time(),
+                }, _f, indent=2)
+        except Exception:
+            pass
 
         # ---- 5. Persist verdicts for future fast-path ----
         for op in applied_ops:

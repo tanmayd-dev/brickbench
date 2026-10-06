@@ -120,7 +120,7 @@ class TestVerifyPlanIntegration:
     skip unless the AVD exists, so CI can still run the unit tests."""
     @pytest.mark.slow
     @pytest.mark.skipif(
-        not Path("/home/tanmay/.android/avd/aosp_vanilla.avd").exists(),
+        not Path("/home/tanmay/.android/avd/bb_aosp36.avd").exists(),
         reason="AVD not present — skip integration test",
     )
     def test_verify_plan_boot(self, tmp_path):
@@ -151,7 +151,7 @@ class TestVerifyPlanIntegration:
                 data_dir=tmp_path,
             )
             # We just assert it returns a VerificationResult, not that it boots.
-            assert isinstance(result, type(sys.modules["brickbench.evaluator"].VerificationResult))
+            assert isinstance(result, VerificationResult)
             assert result.target == "aosp-vanilla"
         except Exception as e:
             # Expected in a plain environment without a fully-set AVD;

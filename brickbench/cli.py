@@ -68,14 +68,33 @@ def init_cmd():
 @cli.command("resume")
 @click.option("--max-emulator", default=1, type=int, help="Max concurrent emulator instances (for live mode).")
 @click.option("--max-llm", default=None, type=int, help="Max parallel LLM calls.")
-def resume_cmd(max_emulator: int, max_llm: Optional[int]):
-    """Scan for pending runs and execute one step.
+@click.option("--max-steps", default=0, type=int, help="Max steps per invocation (0 = drain until no pending work).")
+def resume_cmd(max_emulator: int, max_llm: Optional[int], max_steps: int):
+    """Scan for pending runs and execute them until none remain.
 
-    Call repeatedly until it reports 0 pending work.
+    Each step is one matrix cell: a real LLM plan call (openrouter/local),
+    then safe-list verify (plan_only) or a real emulator boot (live).
+    `skipped` = provider with no backend wired (zen/agy/codex).
     """
     from pathlib import Path
     import sqlite3 as sq
     from brickbench.runner import Runner
+
+    if max_emulator > 1:
+        import shutil
+        mem_gb = 0.0
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemAvailable:"):
+                        mem_gb = int(line.split()[1]) / 1e6
+                        break
+        except OSError:
+            pass
+        if mem_gb and mem_gb < max_emulator * 2.5:
+            click.echo(f"⚠️  Only ~{mem_gb:.1f} GB RAM available; "
+                       f"{max_emulator} emulators want ~{max_emulator * 2} GB. "
+                       f"Consider --max-emulator 1.")
 
     data_dir = Path("data/runs")
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +106,11 @@ def resume_cmd(max_emulator: int, max_llm: Optional[int]):
     initial_pending = conn.execute(
         "SELECT count(*) FROM runs WHERE status='pending'"
     ).fetchone()[0]
+    if initial_pending == 0:
+        click.echo("No pending runs.")
+        runner.close()
+        conn.close()
+        return
     click.echo(f"📋 Starting: {initial_pending} pending runs")
 
     import concurrent.futures
@@ -94,27 +118,29 @@ def resume_cmd(max_emulator: int, max_llm: Optional[int]):
     n = 0
     pending_count = initial_pending
     workers = max(max_llm or 1, 1)  # At least 1 worker
+    limit = max_steps if max_steps and max_steps > 0 else float("inf")
 
     with tqdm(total=initial_pending, desc="Resuming runs", unit="run",
               bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]") as pbar:
-        while n < 100 and pending_count > 0:
-            # Run up to `workers` step() calls in parallel
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-                futures = [executor.submit(runner.step) for _ in range(workers)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            while n < limit and pending_count > 0:
+                # Keep `workers` steps in flight; top up as each completes.
+                futures = {executor.submit(runner.step) for _ in range(min(workers, pending_count))}
                 for future in concurrent.futures.as_completed(futures):
                     try:
                         result = future.result()
                         if result == 1:
                             n += 1
                             pbar.update(1)
-                        pending_count = conn.execute(
-                            "SELECT count(*) FROM runs WHERE status='pending'"
-                        ).fetchone()[0]
                     except Exception as e:
                         click.echo(f"Error in worker: {e}")
-
-            if pending_count == 0:
-                break
+                    pending_count = conn.execute(
+                        "SELECT count(*) FROM runs WHERE status='pending'"
+                    ).fetchone()[0]
+                    if pending_count == 0 or n >= limit:
+                        break
+                if pending_count == 0:
+                    break
 
     click.echo(f"\n✅ Done: {n} steps executed, {pending_count} pending runs left")
     runner.close()
@@ -122,27 +148,19 @@ def resume_cmd(max_emulator: int, max_llm: Optional[int]):
 
 
 @cli.command("run")
-@click.option("--max-emulator", default=1, type=int, help="Max concurrent emulator instances.")
-@click.option("--max-llm", default=None, type=int, help="Max parallel LLM calls (per-provider quota).")
 @click.option("--providers", multiple=True, default=[], help="Provider tags to include (zen agy codex openrouter local).")
 @click.option("--targets", multiple=True, default=[], help="Target tags to include.")
 @click.option("--modes", multiple=True, default=["plan_only", "live"], help="Eval modes.")
 @click.option("--debloat-modes", multiple=True, default=["uninstall"], help="Debloat mode(s).")
 @click.option("--prompt-variants", multiple=True, default=["baseline"], help="Prompt variant tags.")
 def run_command(
-    max_emulator: int,
-    max_llm: Optional[int],
     providers: Tuple[str, ...],
     targets: Tuple[str, ...],
     modes: Tuple[str, ...],
     debloat_modes: Tuple[str, ...],
     prompt_variants: Tuple[str, ...],
 ):
-    """Execute the full brickbench matrix.
-
-    This builds the Cartesian product of the given dimensions and runs each
-    cell through the runner, persisting everything to the data dir.
-    """
+    """Enqueue the full brickbench matrix (no execution; `resume` runs it)."""
     from brickbench.config import PROCESS_PROVIDERS, PROCESS_MODES, DEBLOAT_MODES, PACKAGES_PER_TARGET
 
     # Resolve target keys
@@ -216,7 +234,7 @@ def run_command(
 
     from brickbench.runner import Runner
 
-    runner = Runner(data_dir="data/runs", max_emulator_concurrency=max_emulator, llm_concurrency=max_llm)
+    runner = Runner(data_dir="data/runs")
 
     try:
         total = 0
