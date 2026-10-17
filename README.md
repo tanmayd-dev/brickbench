@@ -2,6 +2,10 @@
 
 Evaluation harness that benchmarks LLM-recommended Android debloat actions for **safety and correctness** — propose a plan with any model, verify it against real emulator checks, and score it reproducibly.
 
+<!-- Record a ~45s terminal screencast and drop it in docs/ (see "Demo" below):
+![brickbench demo](docs/demo.gif)
+-->
+
 ## How It Works
 
 1. **Enqueue** — `brickbench run` builds a matrix of `(model × ROM target × prompt variant × mode)` runs in SQLite.
@@ -13,6 +17,38 @@ Evaluation harness that benchmarks LLM-recommended Android debloat actions for *
 5. **Export** — dump runs + verdicts to JSON/CSV for analysis.
 
 Targets cover AOSP (vanilla/GApps/Play), LineageOS, /e/OS GSI, and an OEM-combined image. Concurrency is semaphore-gated per emulator with atomic run claiming, so parallel workers never double-execute.
+
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph enqueue["1 · Enqueue"]
+        CLI["brickbench run"] --> MATRIX[("SQLite (WAL)<br/>model × target × variant × mode")]
+    end
+
+    subgraph propose["2 · Propose"]
+        MATRIX --> LLM["Model<br/>OpenRouter / Ollama"]
+        LLM --> PLAN["JSON plan<br/>≤ 2 packages"]
+    end
+
+    subgraph verify["3 · Verify"]
+        PLAN --> MODE{"mode"}
+        MODE -->|plan_only| STATIC["Static check<br/>safe-list + critical-package set"]
+        MODE -->|live| EMU["Boot emulator snapshot →<br/>apply plan → functional probes"]
+    end
+
+    subgraph score["4 · Score & reuse"]
+        STATIC --> VERDICT["Verdict + SHA-256 hash<br/>boot time · violations · bytes freed"]
+        EMU --> VERDICT
+        VERDICT --> SAFELIST[("Learned safe-list")]
+        SAFELIST -.->|fast path| STATIC
+        VERDICT --> EXPORT["export → JSON / CSV"]
+    end
+```
+
+The key design choice: a model's output is **never trusted on its own**. Every plan is
+scored against reality — either the learned safe-list (cheap) or a booted emulator
+(expensive but authoritative) — and every verdict is hashed so results can't silently drift.
 
 ## Tech Stack
 
@@ -54,6 +90,22 @@ brickbench export --format json --output results.json # dump results
 pytest -q               # unit tests
 pytest -q -m "not slow" # skip emulator-gated tests
 ```
+
+## Demo
+
+brickbench is a batch harness, not a service — there is no URL to click, and that's
+fine. The honest way to show it working is a short terminal recording plus a committed
+results table.
+
+```bash
+brickbench init
+brickbench run --providers openrouter --modes plan_only   # enqueue
+brickbench resume --max-llm 2                             # watch runs execute
+brickbench export --format csv --output results.csv       # show the results
+```
+
+Recording tip: the *interesting* part is a verdict where the model proposed something
+unsafe and the harness caught it. Lead with that, not with a happy path.
 
 ## CLI Reference
 
