@@ -100,7 +100,7 @@ class TestFixtureReport:
 
 
 class TestDerivedMetrics:
-    def test_boot_delta_uses_fastest_successful_boot(self, tmp_path):
+    def test_boot_delta_uses_median_baseline(self, tmp_path):
         db = tmp_path / "bench.db"
         _build_db(db, [
             {"target": "t", "mode": "live", "boot_ok": True, "boot_s": 10.0, "tokens": 100},
@@ -112,9 +112,9 @@ class TestDerivedMetrics:
         assert s["boot_measured"] == 2
         assert s["live_results"] == 3
         assert s["boot_success_pct"] == 66.7
-        assert s["boot_delta_s"] == 1.0  # (10-10 + 12-10) / 2
+        assert s["boot_delta_s"] == 0.0  # (10-11 + 12-11) / 2
         assert s["tokens_total"] == 600
-        assert report["targets"][0]["baseline_boot_s"] == 10.0
+        assert report["targets"][0]["baseline_boot_s"] == 11.0
 
     def test_critical_and_safety_failures_are_distinct(self, tmp_path):
         db = tmp_path / "bench.db"

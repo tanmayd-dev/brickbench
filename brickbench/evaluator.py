@@ -49,6 +49,7 @@ class VerificationResult:
     errors: List[str]  # any unexpected failures during verify
     probes_passed: Dict[str, bool] = field(default_factory=dict)
     packages_proposed: List[Dict[str, str]] = field(default_factory=list)
+    boot_cycle_times: List[float] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +239,42 @@ def _boot_emulator(
     if not boot_ok:
         boot_time = _time.time() - start
     return proc, serial, boot_ok, boot_time
+
+
+def _warm_reboot_cycle(serial: str, timeout_s: int = 120, proc=None) -> Tuple[bool, float]:
+    """Perform a warm framework restart and measure time until sys.boot_completed=1.
+
+    Allows post-debloat Android caches and PackageManager re-indexing to settle
+    so steady-state warm reboot timings are measured without early cold jitter.
+    """
+    import subprocess
+    import time as _time
+    try:
+        # Reset property so wait loop only catches the new completed state
+        subprocess.run(["adb", "-s", serial, "shell", "setprop", "sys.boot_completed", "0"], capture_output=True, timeout=10)
+        # Restart Android framework services (Zygote / SystemServer)
+        subprocess.run(["adb", "-s", serial, "shell", "stop"], capture_output=True, timeout=15)
+        _time.sleep(1)
+        start = _time.time()
+        subprocess.run(["adb", "-s", serial, "shell", "start"], capture_output=True, timeout=15)
+        boot_ok = False
+        while _time.time() - start < timeout_s:
+            if proc and proc.poll() is not None:
+                break
+            try:
+                r = subprocess.run(
+                    ["adb", "-s", serial, "shell", "getprop", "sys.boot_completed"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                if r.stdout.strip() == "1":
+                    boot_ok = True
+                    break
+            except Exception:
+                pass
+            _time.sleep(2)
+        return boot_ok, round(_time.time() - start, 3)
+    except Exception:
+        return False, 0.0
 
 
 def _stop_emulator(proc, serial: str) -> None:
@@ -432,18 +469,55 @@ def verify_plan(
         applied_ops: List[Dict[str, str]] = list(plan_actions)
 
         # ---- 2. Boot gate + probes (live only; plan-only uses safe-list) ----
+        boot_cycle_times: List[float] = []
         if mode == "live":
             emu_bin = _emulator_path()
             avd_name = _avd_name(target_key)
             log_path = Path(str(data_dir)) / f"emu_{avd_name}_{adb_port}.log"
-            proc, serial, boot_ok, boot_time = _boot_emulator(
+            proc, serial, boot_ok, initial_boot_time = _boot_emulator(
                 emu_bin, avd_name, adb_port=adb_port, snapshot=emu_snapshot,
                 ram_mb=emu_ram_mb, timeout_s=emu_timeout_s, log_path=log_path,
             )
+            boot_cycle_times.append(initial_boot_time)
             try:
                 if boot_ok:
-                    safety_passed, probe_failures, probes_passed = _functional_probes(serial)
+                    # Apply debloat operations on the live instance
+                    for op in applied_ops:
+                        pkg = op.get("pkg", "")
+                        act = op.get("action", debloat_mode)
+                        try:
+                            if act == "uninstall":
+                                subprocess.run(["adb", "-s", serial, "shell", "pm", "uninstall", "-k", "--user", "0", pkg], capture_output=True, timeout=15)
+                            elif act == "disable":
+                                subprocess.run(["adb", "-s", serial, "shell", "pm", "disable-user", "--user", "0", pkg], capture_output=True, timeout=15)
+                        except Exception:
+                            pass
+
+                    # Execute warm reboot cycles (settles cold re-indexing, taking 3rd boot for steady-state warm measurement)
+                    boot_cycles = int(_os.environ.get("BRICKBENCH_BOOT_CYCLES", "3"))
+                    measured_boot_time = initial_boot_time
+                    for _ in range(1, max(1, boot_cycles)):
+                        warm_ok, warm_time = _warm_reboot_cycle(serial, timeout_s=emu_timeout_s, proc=proc)
+                        if warm_ok:
+                            boot_cycle_times.append(warm_time)
+                            measured_boot_time = warm_time
+                        else:
+                            boot_ok = False
+                            break
+
+                    boot_time = measured_boot_time
+                    if boot_ok:
+                        safety_passed, probe_failures, probes_passed = _functional_probes(serial)
+                    else:
+                        safety_passed, probe_failures = False, ["warm reboot gate failed"]
+                        probes_passed = {
+                            "pm_list": False,
+                            "dumpsys_settings": False,
+                            "service_check": False,
+                            "launcher_intent": False,
+                        }
                 else:
+                    boot_time = initial_boot_time
                     safety_passed, probe_failures = False, ["boot gate failed"]
                     probes_passed = {
                         "pm_list": False,
@@ -500,6 +574,7 @@ def verify_plan(
             errors=list(probe_failures),
             probes_passed=probes_passed,
             packages_proposed=applied_ops,
+            boot_cycle_times=boot_cycle_times,
         )
 
         # ---- 4b. Write transcript (evidence that work happened) ----
@@ -528,6 +603,7 @@ def verify_plan(
                         "tokens_used": tokens_used,
                         "errors": list(probe_failures),
                         "probes_passed": probes_passed,
+                        "boot_cycle_times": boot_cycle_times,
                     },
                     "recorded_at": _time.time(),
                 }, _f, indent=2)

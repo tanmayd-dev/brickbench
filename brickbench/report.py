@@ -455,14 +455,19 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
             "packages_proposed": list(res.get("packages_proposed", [])),
         })
 
-    # Boot baseline per target: fastest successful live boot observed for that
-    # target. Delta = run boot time - baseline; negative means faster.
+    # Boot baseline per target: median of successful live boots observed for that
+    # target (robust against single-run jitter and cold re-indexing noise).
+    # Delta = run boot time - baseline; negative means faster than baseline (speedup).
+    import statistics
     baselines: Dict[str, float] = {}
-    for r in rows:
-        if r["mode"] == "live" and r["boot_success"] and r["boot_time_s"] > 0:
-            current = baselines.get(r["target"])
-            if current is None or r["boot_time_s"] < current:
-                baselines[r["target"]] = r["boot_time_s"]
+    for key in {r["target"] for r in rows}:
+        live_boots = [
+            r["boot_time_s"]
+            for r in rows
+            if r["target"] == key and r["mode"] == "live" and r["boot_success"] and r["boot_time_s"] > 0
+        ]
+        if live_boots:
+            baselines[key] = round(float(statistics.median(live_boots)), 3)
 
     summary = _aggregate(rows, baselines)
     summary["runs"] = len(runs)
@@ -1365,7 +1370,7 @@ def render_html(report: Dict[str, Any]) -> str:
     Evaluations can be executed deterministically in Podman via <code>podman play kube pod.yaml</code> or <code>./scripts/run_pod.sh</code>.
   </p>
   <p>
-    Boot baseline represents the fastest verified clean boot for each ROM target. Boot delta is post-debloat boot minus baseline:
+    Boot baseline represents the median verified clean boot for each ROM target. Boot delta is post-debloat boot minus baseline:
     negative (&Delta;s &lt; 0) denotes faster startup (speedup); positive (&Delta;s &gt; 0) denotes boot regression.
     Safety pass requires functional probe completion across all 4 OS subsystems and zero critical package violations.
   </p>
