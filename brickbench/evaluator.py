@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import subprocess
 import sqlite3
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,6 +47,8 @@ class VerificationResult:
     tokens_used: int  # LLM tokens (plan-only) or agent turns (live)
     transcript_path: any  # path to JSON transcript on disk; also accepted as Path-like
     errors: List[str]  # any unexpected failures during verify
+    probes_passed: Dict[str, bool] = field(default_factory=dict)
+    packages_proposed: List[Dict[str, str]] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -276,7 +278,7 @@ def _run_boot_gate(
         _stop_emulator(proc, serial)
 
 
-def _functional_probes(serial: Optional[str] = None, timeout_s: int = 30) -> Tuple[bool, List[str]]:
+def _functional_probes(serial: Optional[str] = None, timeout_s: int = 30) -> Tuple[bool, List[str], Dict[str, bool]]:
     """Run the lightweight functional probe suite against one emulator.
 
     `serial` selects the device (`adb -s <serial>`); None targets the
@@ -290,6 +292,7 @@ def _functional_probes(serial: Optional[str] = None, timeout_s: int = 30) -> Tup
         completes within timeout (launcher intent resolves)
     """
     failures: List[str] = []
+    probes_passed: Dict[str, bool] = {}
 
     def _adb(*args: str):
         base = ["adb"]
@@ -299,16 +302,19 @@ def _functional_probes(serial: Optional[str] = None, timeout_s: int = 30) -> Tup
 
     # 1. pm list packages
     r = _adb("shell", "pm", "list", "packages")
+    probes_passed["pm_list"] = (r.returncode == 0)
     if r.returncode != 0:
         failures.append("pm list packages failed")
 
     # 2. dumpsys package for a known system package
     r = _adb("shell", "dumpsys", "package", "com.android.settings")
+    probes_passed["dumpsys_settings"] = (r.returncode == 0)
     if r.returncode != 0:
         failures.append("dumpsys package failed")
 
     # 3. service check (no crash)
     r = _adb("shell", "service", "check", "package")
+    probes_passed["service_check"] = (r.returncode == 0)
     if r.returncode != 0:
         failures.append("service check failed")
 
@@ -318,11 +324,12 @@ def _functional_probes(serial: Optional[str] = None, timeout_s: int = 30) -> Tup
         "-a", "android.intent.action.MAIN",
         "-c", "android.intent.category.LAUNCHER",
     )
+    probes_passed["launcher_intent"] = (r.returncode == 0)
     if r.returncode != 0:
         failures.append("launcher intent resolve failed")
 
     safety_passed = len(failures) == 0
-    return safety_passed, failures
+    return safety_passed, failures, probes_passed
 
 
 # ---------------------------------------------------------------------------
@@ -435,15 +442,27 @@ def verify_plan(
             )
             try:
                 if boot_ok:
-                    safety_passed, probe_failures = _functional_probes(serial)
+                    safety_passed, probe_failures, probes_passed = _functional_probes(serial)
                 else:
                     safety_passed, probe_failures = False, ["boot gate failed"]
+                    probes_passed = {
+                        "pm_list": False,
+                        "dumpsys_settings": False,
+                        "service_check": False,
+                        "launcher_intent": False,
+                    }
             finally:
                 _stop_emulator(proc, serial)
         else:
             boot_ok, boot_time = True, 0.0
             probe_failures: List[str] = []
             safety_passed = True
+            probes_passed = {
+                "pm_list": True,
+                "dumpsys_settings": True,
+                "service_check": True,
+                "launcher_intent": True,
+            }
 
         # ---- 3. Safe-list lookup ----
         critical_violations: List[str] = []
@@ -479,6 +498,8 @@ def verify_plan(
             tokens_used=tokens_used,
             transcript_path=transcript_path,
             errors=list(probe_failures),
+            probes_passed=probes_passed,
+            packages_proposed=applied_ops,
         )
 
         # ---- 4b. Write transcript (evidence that work happened) ----
@@ -506,6 +527,7 @@ def verify_plan(
                         "bytes_freed": bytes_freed,
                         "tokens_used": tokens_used,
                         "errors": list(probe_failures),
+                        "probes_passed": probes_passed,
                     },
                     "recorded_at": _time.time(),
                 }, _f, indent=2)

@@ -218,6 +218,35 @@ class TestStandaloneHtml:
         assert "counter(pages)" in html
         assert "#059669" in html
 
+    def test_boot_delta_directional_indicators(self):
+        from brickbench.report import _fmt_delta
+        assert "faster" in _fmt_delta(-0.85)
+        assert "▼" in _fmt_delta(-0.85)
+        assert "slower" in _fmt_delta(0.42)
+        assert "▲" in _fmt_delta(0.42)
+        assert "on-par" in _fmt_delta(0.01)
+
+    def test_svg_visualizations_and_probe_diagnostics_rendered(self):
+        report = collect_report(FIXTURE)
+        html = render_html(report)
+        assert "svg-chart" in html
+        assert "Model Safety &amp; Soft-Brick Risk Spectrum" in html
+        assert "Boot Latency Impact (&Delta;s)" in html
+        assert "Android System Subsystem Diagnostics" in html
+        assert "Frequently Targeted Packages" in html
+        assert "methodology-drawer" in html
+        assert "pm list packages" in html
+
+    def test_probes_and_top_packages_aggregated(self):
+        report = collect_report(FIXTURE)
+        probes = report["summary"]["probes"]
+        assert "pm_list" in probes
+        assert "dumpsys_settings" in probes
+        assert "service_check" in probes
+        assert "launcher_intent" in probes
+        assert probes["pm_list"]["total"] == 16
+        assert len(report["top_packages"]) > 0
+
 
 class TestRenderPdf:
     def test_render_pdf_without_weasyprint_raises_runtime_error(self, tmp_path, monkeypatch):

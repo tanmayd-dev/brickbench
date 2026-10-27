@@ -227,10 +227,14 @@ def run_command(
                 "cohere/north-mini-code:free", "dots-studio/dots-3-note-preview:free",
                 "inclusionai/ling-3.0-flash-sante:free", "liquid/lfm-2.5-2.6b:free",
                 "apodex/apodex-1.1-mini:free", "nvidia/nemotron-3.5-content-safety:free",
+                "recursive/flint-v1.0:free", "xingchen-agi/xing4.0-29b-a4b:free",
+                "nvidia/nemotron-3.5-super-vl:free", "deepseek/deepseek-v4.1-flash",
+                "meta-llama/llama-3.3-70b-instruct",
             ]
         elif p == "local":
             model_cfgs["local"] = [
                 "qwen3:4b", "phi4-mini:3.8b", "llama3.2:3b", "gemma3:4b",
+                "deepseek-r1:7b", "qwen2.5-coder:7b", "llama3.2:1b",
             ]
         else:
             continue

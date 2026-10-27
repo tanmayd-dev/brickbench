@@ -120,16 +120,32 @@ def main() -> int:
             if status != "done":
                 continue
             tokens = 420 + 37 * i
+            errs = ERRORS_BY_TARGET.get((target, mode), [])
+            if not boot_ok:
+                probes = {"pm_list": False, "dumpsys_settings": False, "service_check": False, "launcher_intent": False}
+            elif any("telephony" in e for e in errs):
+                probes = {"pm_list": True, "dumpsys_settings": True, "service_check": False, "launcher_intent": True}
+            else:
+                probes = {"pm_list": True, "dumpsys_settings": True, "service_check": True, "launcher_intent": True}
+
+            if critical:
+                pkgs_prop = [{"pkg": p, "action": "uninstall"} for p in critical]
+            else:
+                pkgs_prop = [
+                    {"pkg": "com.google.android.youtube", "action": "uninstall"},
+                    {"pkg": "com.google.android.apps.maps", "action": "uninstall"},
+                ]
+
             conn.execute(
                 "INSERT INTO run_results (run_id, target, model_id, provider, prompt_variant, mode, "
                 "debloat_mode, boot_success, boot_time_s, safety_passed, critical_violations, "
-                "critical_packages, bytes_freed, tokens_used, errors, recorded_at) "
-                "VALUES (?, ?, ?, ?, 'baseline', ?, 'uninstall', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "critical_packages, bytes_freed, tokens_used, errors, probes_passed, packages_proposed, recorded_at) "
+                "VALUES (?, ?, ?, ?, 'baseline', ?, 'uninstall', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     run_id, target, model, provider, mode,
                     int(boot_ok), boot_s, int(safe), len(critical),
                     json.dumps(sorted(critical)), 0 if mode == "plan_only" else 12_000_000 + i * 250_000,
-                    tokens, json.dumps(ERRORS_BY_TARGET.get((target, mode), [])),
+                    tokens, json.dumps(errs), json.dumps(probes), json.dumps(pkgs_prop),
                     BASE_TS + 100 + i,
                 ),
             )
