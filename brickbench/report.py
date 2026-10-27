@@ -409,26 +409,59 @@ tr:last-child td { border-bottom: 0; }
 td.ok { color: var(--good); } td.bad { color: var(--bad); }
 code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .empty { color: var(--muted); background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; padding: 18px; }
-footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
+.header-top { display: flex; justify-content: space-between; align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+.tagline { margin: 6px 0 0; color: var(--muted); font-size: 13.5px; }
+.btn-pdf { display: inline-flex; align-items: center; gap: 6px; padding: 8px 14px; background: var(--panel-2); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; text-decoration: none; font-size: 12.5px; font-weight: 500; transition: border-color 0.15s; }
+.btn-pdf:hover { border-color: var(--accent); color: var(--accent); }
+.meta-strip { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 14px; padding-top: 12px; border-top: 1px dashed var(--line); font-size: 12px; color: var(--muted); }
+.meta-strip span { display: inline-flex; align-items: center; gap: 4px; }
+.meta-strip strong { color: var(--ink); }
+.callout { background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent); border-radius: 8px; padding: 14px 18px; margin-top: 20px; font-size: 13.5px; line-height: 1.5; }
+.callout.warn { border-left-color: var(--bad); }
+.callout strong { color: var(--ink); }
+.info-section { margin-top: 28px; }
+.info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-top: 12px; }
+.info-card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; font-size: 13px; color: var(--muted); line-height: 1.5; }
+.info-card h3 { margin: 0 0 6px; font-size: 14px; color: var(--ink); }
+.info-card p { margin: 0; }
+.card-tag { display: inline-block; font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--accent); margin-bottom: 6px; font-weight: 600; }
+.probe-list { margin: 8px 0 0; padding-left: 18px; }
+.probe-list li { margin-bottom: 4px; }
+.target-tags { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 10px; margin-top: 12px; }
+.target-tag-item { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font-size: 12px; }
+.target-tag-item strong { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); margin-bottom: 2px; }
+.target-tag-item span { color: var(--muted); }
+footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.6; }
 @media (max-width: 640px) { body { padding: 0 12px 32px; } .card strong { font-size: 24px; } th, td { padding: 7px 8px; } }
 @media print {
-  @page { size: A4; margin: 1.5cm 1.2cm; @bottom-right { content: "Page " counter(page) " of " counter(pages); font-size: 8pt; color: #64748b; } }
-  body { background: #ffffff !important; color: #0f172a !important; font-size: 11pt; padding: 0 !important; }
+  @page { size: A4; margin: 1.4cm 1.2cm; @bottom-right { content: "Page " counter(page) " of " counter(pages); font-size: 8pt; color: #64748b; } }
+  body { background: #ffffff !important; color: #0f172a !important; font-size: 10.5pt; padding: 0 !important; }
   header { border-bottom: 1px solid #cbd5e1 !important; padding: 12px 0 !important; }
-  h1 { color: #0f172a !important; font-size: 20pt !important; }
+  h1 { color: #0f172a !important; font-size: 19pt !important; }
   h1 span { color: #059669 !important; }
-  .sub { color: #64748b !important; }
-  h2 { color: #475569 !important; font-size: 12pt !important; margin: 20px 0 8px !important; }
+  .sub, .tagline { color: #64748b !important; }
+  .btn-pdf, .header-actions { display: none !important; }
+  .meta-strip { border-top-color: #cbd5e1 !important; color: #64748b !important; }
+  .meta-strip strong { color: #0f172a !important; }
+  .callout { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; border-left: 4px solid #059669 !important; color: #1e293b !important; page-break-inside: avoid; break-inside: avoid; }
+  .callout.warn { border-left-color: #dc2626 !important; }
+  h2 { color: #475569 !important; font-size: 11pt !important; margin: 18px 0 8px !important; }
   .card { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; break-inside: avoid; padding: 10px !important; }
   .card .label { color: #64748b !important; }
-  .card strong { font-size: 20pt !important; color: #0f172a !important; }
+  .card strong { font-size: 18pt !important; color: #0f172a !important; }
   .card.good strong { color: #059669 !important; }
   .card.bad strong { color: #dc2626 !important; }
   .card.warn strong { color: #d97706 !important; }
+  .info-card { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; break-inside: avoid; color: #334155 !important; }
+  .info-card h3 { color: #0f172a !important; }
+  .card-tag { color: #059669 !important; }
+  .target-tag-item { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; break-inside: avoid; }
+  .target-tag-item strong { color: #059669 !important; }
+  .target-tag-item span { color: #475569 !important; }
   table { background: #ffffff !important; border: 1px solid #cbd5e1 !important; page-break-inside: auto; break-inside: auto; }
   tr { page-break-inside: avoid; break-inside: avoid; }
   th { background: #f1f5f9 !important; color: #475569 !important; border-bottom: 1px solid #cbd5e1 !important; }
-  td { border-bottom: 1px solid #e2e8f0 !important; color: #0f172a !important; font-size: 9pt !important; padding: 6px 8px !important; }
+  td { border-bottom: 1px solid #e2e8f0 !important; color: #0f172a !important; font-size: 8.5pt !important; padding: 5px 7px !important; }
   td.ok { color: #059669 !important; }
   td.bad { color: #dc2626 !important; }
   footer { border-top: 1px solid #cbd5e1 !important; color: #64748b !important; page-break-inside: avoid; }
@@ -564,30 +597,147 @@ def render_html(report: Dict[str, Any]) -> str:
         _card("Token spend", _fmt_int(s["tokens_total"]), tokens_meta),
     ])
 
+    callout_cls = "callout warn" if s["critical_failures"] > 0 else "callout"
+    if s["results"] == 0:
+        callout_html = '<div class="callout">No scored evaluation runs recorded in this database yet.</div>'
+    elif s["critical_failures"] > 0:
+        callout_html = (
+            f'<div class="{callout_cls}"><strong>Safety Alert:</strong> Detected <strong>{_fmt_int(s["critical_failures"])}</strong> '
+            f'critical package removal attempts across {_fmt_int(s["results"])} scored evaluations. These plans attempted removing '
+            'essential OS-level dependencies (such as Settings, SystemUI, or PackageInstaller), which trigger soft-bricked bootloops.</div>'
+        )
+    else:
+        callout_html = (
+            f'<div class="{callout_cls}"><strong>Optimal Safety Profile:</strong> 100% of the {_fmt_int(s["results"])} scored runs '
+            'preserved critical ROM boundaries with zero soft-brick package removals detected.</div>'
+        )
+
     return f"""<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>BrickBench report</title>
+<title>BrickBench Evaluation Report</title>
 <style>{_CSS}</style>
 </head>
 <body>
 <header>
-  <h1>Brick<span>Bench</span> report</h1>
-  <p class="sub">{_html.escape(str(report['database']))} · generated {_html.escape(str(report['generated_at']))} · v{_html.escape(str(report['tool_version']))}</p>
-  <p class="sub">{_fmt_int(s['runs'])} enqueued runs ({_html.escape(status_bits)})</p>
+  <div class="header-top">
+    <div>
+      <h1>Brick<span>Bench</span> report</h1>
+      <p class="tagline">Autonomous Safety &amp; Correctness Benchmark for LLM-Recommended Android Debloat Plans</p>
+    </div>
+    <div class="header-actions">
+      <a href="report.pdf" class="btn-pdf" download>Download PDF Report</a>
+    </div>
+  </div>
+  <div class="meta-strip">
+    <span>Database: <code>{_html.escape(str(report['database']))}</code></span>
+    <span>Generated: <strong>{_html.escape(str(report['generated_at']))}</strong></span>
+    <span>Harness: <code>v{_html.escape(str(report['tool_version']))}</code></span>
+    <span>Matrix: <strong>{_fmt_int(s['runs'])} enqueued runs</strong> ({_html.escape(status_bits)})</span>
+  </div>
 </header>
 <main>
+  {callout_html}
   <section class="cards">{cards}</section>
-  <section><h2>Per target</h2>{_render_targets(report['targets'])}</section>
-  <section><h2>Per model</h2>{_render_models(report['models'])}</section>
-  <section><h2>Failures</h2>{_render_failures(report['failures'], report['failures_total'])}</section>
+  <section class="info-section">
+    <h2>Evaluation Methodology &amp; Architecture</h2>
+    <div class="info-grid">
+      <article class="info-card">
+        <span class="card-tag">Zero-Trust Philosophy</span>
+        <h3>Why Debloat Plans Must Be Verified</h3>
+        <p>
+          Language models frequently recommend removing packages that appear unneeded but serve as foundational IPC
+          providers or binder endpoints in Android. Removing them causes immediate bootloops or runtime crashes.
+          BrickBench treats every debloat plan as untrusted until proven safe against real system probes.
+        </p>
+      </article>
+      <article class="info-card">
+        <span class="card-tag">Tier 1 · Static Check</span>
+        <h3>Static Safe-List (<code>plan_only</code>)</h3>
+        <p>
+          Fast static analysis validating proposed actions against ROM critical package sets and an authoritative SQLite
+          safe-list. Plans proposing removal of system-critical components are flagged immediately with zero compute overhead.
+          Verified verdicts are hashed with SHA-256 for fast-path reuse.
+        </p>
+      </article>
+      <article class="info-card">
+        <span class="card-tag">Tier 2 · Dynamic Probes</span>
+        <h3>Snapshot Emulator Boot (<code>live</code>)</h3>
+        <p>
+          Restores an Android QEMU snapshot on an isolated ADB port, applies package removals, measures boot duration to
+          <code>sys.boot_completed=1</code> against clean baselines, and executes four health probes:
+        </p>
+        <ul class="probe-list">
+          <li><code>pm list packages</code> — Package manager daemon IPC responsiveness.</li>
+          <li><code>dumpsys package com.android.settings</code> — System framework binding integrity.</li>
+          <li><code>service check package</code> — Core service stability without fault crashes.</li>
+          <li><code>am start -a ... LAUNCHER</code> — Resolution and rendering of default home launcher.</li>
+        </ul>
+      </article>
+    </div>
+  </section>
+  <section class="info-section">
+    <h2>Metrics Guide &amp; Scoring Interpretation</h2>
+    <div class="info-grid">
+      <article class="info-card">
+        <span class="card-tag">Pass Criteria</span>
+        <h3>Safety Pass %</h3>
+        <p>
+          The core benchmark score: scored runs where all 4 functional health probes passed and zero packages from the
+          ROM's critical set were uninstalled. A single broken probe or critical package deletion marks the run as failed.
+        </p>
+      </article>
+      <article class="info-card">
+        <span class="card-tag">Soft-Brick Risk</span>
+        <h3>Critical Failures</h3>
+        <p>
+          The count of evaluation runs that recommended deleting core operating system components. Indicates high risk of
+          unrecoverable bootloop or system crash for end users.
+        </p>
+      </article>
+      <article class="info-card">
+        <span class="card-tag">Performance</span>
+        <h3>Boot Delta (&Delta;s)</h3>
+        <p>
+          Mean difference between post-debloat boot time and the fastest clean snapshot boot on that ROM target. Negative
+          values indicate genuine startup speedups; positive deltas denote boot regressions.
+        </p>
+      </article>
+      <article class="info-card">
+        <span class="card-tag">Efficiency &amp; Space</span>
+        <h3>Tokens &amp; Storage Freed</h3>
+        <p>
+          Cumulative and mean token usage tracks model reasoning cost per proposal. Storage freed calculates combined
+          APK, Odex, and data size reclaimed from system partitions for safe actions.
+        </p>
+      </article>
+    </div>
+  </section>
+  <section class="info-section">
+    <h2>Target ROM Profiles</h2>
+    <div class="target-tags">
+      <div class="target-tag-item"><strong>aosp-vanilla</strong><span>Pure Android Open Source Project baseline</span></div>
+      <div class="target-tag-item"><strong>aosp-gapps</strong><span>AOSP integrated with Google Mobile Services (GMS)</span></div>
+      <div class="target-tag-item"><strong>aosp-play</strong><span>Consumer Google Play Store production image</span></div>
+      <div class="target-tag-item"><strong>lineage-23.2</strong><span>LineageOS community distribution with privacy tweaks</span></div>
+      <div class="target-tag-item"><strong>e-os-gsi</strong><span>/e/OS Generic System Image with microG core services</span></div>
+    </div>
+  </section>
+  <section><h2>Per target breakdown</h2>{_render_targets(report['targets'])}</section>
+  <section><h2>Per model breakdown</h2>{_render_models(report['models'])}</section>
+  <section><h2>Failures &amp; Violations</h2>{_render_failures(report['failures'], report['failures_total'])}</section>
 </main>
 <footer>
-  Boot baseline is the fastest successful live boot observed for that target;
-  boot delta is the mean change against it (negative is faster).
-  Safety pass counts scored runs whose functional probes and critical-package checks passed.
+  <p>
+    <strong>Reproducibility:</strong> Every evaluation run is hashed with SHA-256 (<code>plan_hash</code> and <code>result_hash</code>).
+    Evaluations can be executed deterministically in Podman via <code>podman play kube pod.yaml</code> or <code>./scripts/run_pod.sh</code>.
+  </p>
+  <p>
+    Boot baseline represents the fastest verified clean boot for each ROM target; boot delta is the mean change (negative is faster).
+    Safety pass requires functional probe completion and zero critical package violations.
+  </p>
 </footer>
 </body>
 </html>
