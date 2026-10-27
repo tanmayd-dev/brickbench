@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: brickbench-pod
+  labels:
+    app: brickbench
+spec:
+  restartPolicy: Never
+  hostNetwork: true
+  containers:
+    - name: brickbench
+      image: localhost/brickbench:latest
+      env:
+        - name: OPENROUTER_API_KEY
+          value: ""
+      volumeMounts:
+        - name: data-vol
+          mountPath: /workspace/data
+        - name: dist-vol
+          mountPath: /workspace/dist
+    # Optional: uncomment to run an in-pod local Ollama service:
+    # - name: ollama
+    #   image: docker.io/ollama/ollama:latest
+    #   ports:
+    #     - containerPort: 11434
+    #       hostPort: 11434
+  volumes:
+    - name: data-vol
+      hostPath:
+        path: ./data
+    - name: dist-vol
+      hostPath:
+        path: ./dist

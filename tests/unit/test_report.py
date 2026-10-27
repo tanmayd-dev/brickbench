@@ -16,6 +16,7 @@ from brickbench.report import (
     record_run_result,
     render_html,
     render_json,
+    render_pdf,
 )
 
 FIXTURE = Path(__file__).resolve().parents[2] / "data" / "fixtures" / "report_fixture.db"
@@ -208,6 +209,46 @@ class TestStandaloneHtml:
         for label in ("Safety pass", "Critical failures", "Boot delta", "Token spend"):
             assert label in html
 
+    def test_print_media_css_included(self):
+        html = render_html(collect_report(FIXTURE))
+        assert "@media print" in html
+        assert "@page" in html
+        assert "A4" in html
+        assert "counter(page)" in html
+        assert "counter(pages)" in html
+        assert "#059669" in html
+
+
+class TestRenderPdf:
+    def test_render_pdf_without_weasyprint_raises_runtime_error(self, tmp_path, monkeypatch):
+        import sys
+        monkeypatch.setitem(sys.modules, "weasyprint", None)
+        report = collect_report(FIXTURE)
+        out = tmp_path / "report.pdf"
+        with pytest.raises(RuntimeError) as exc_info:
+            render_pdf(report, out)
+        assert "PDF export requires 'weasyprint'" in str(exc_info.value)
+        assert "pip install .[pdf]" in str(exc_info.value)
+
+    def test_render_pdf_with_weasyprint(self, tmp_path):
+        from unittest.mock import MagicMock, patch
+        mock_weasy = MagicMock()
+        mock_html_inst = MagicMock()
+        mock_weasy.HTML.return_value = mock_html_inst
+
+        report = collect_report(FIXTURE)
+        out = tmp_path / "sub" / "report.pdf"
+
+        with patch.dict("sys.modules", {"weasyprint": mock_weasy}):
+            render_pdf(report, out)
+
+        mock_weasy.HTML.assert_called_once()
+        _, kwargs = mock_weasy.HTML.call_args
+        html_str = kwargs.get("string")
+        assert "Brick<span>Bench</span> report" in html_str
+        assert "@media print" in html_str
+        mock_html_inst.write_pdf.assert_called_once_with(target=str(out))
+
 
 class TestReportCli:
     def test_html_output(self, tmp_path):
@@ -227,6 +268,54 @@ class TestReportCli:
         )
         assert result.exit_code == 0, result.output
         assert json.loads(out.read_text(encoding="utf-8"))["summary"]["results"] == 16
+
+    def test_pdf_auto_detection(self, tmp_path):
+        from unittest.mock import patch
+        out = tmp_path / "report.pdf"
+        with patch("brickbench.report.render_pdf") as mock_render:
+            result = CliRunner().invoke(
+                cli, ["report", "--db", str(FIXTURE), "--output", str(out)]
+            )
+            assert result.exit_code == 0, result.output
+            mock_render.assert_called_once()
+            args, _ = mock_render.call_args
+            assert args[0]["summary"]["results"] == 16
+            assert str(args[1]) == str(out)
+            assert "Report (pdf) written to" in result.output
+
+    def test_explicit_format_pdf(self, tmp_path):
+        from unittest.mock import patch
+        out = tmp_path / "custom_named_file"
+        with patch("brickbench.report.render_pdf") as mock_render:
+            result = CliRunner().invoke(
+                cli, ["report", "--db", str(FIXTURE), "--output", str(out), "--format", "pdf"]
+            )
+            assert result.exit_code == 0, result.output
+            mock_render.assert_called_once()
+            args, _ = mock_render.call_args
+            assert str(args[1]) == str(out)
+            assert "Report (pdf) written to" in result.output
+
+    def test_cli_auto_detect_json(self, tmp_path):
+        out = tmp_path / "report.json"
+        result = CliRunner().invoke(
+            cli, ["report", "--db", str(FIXTURE), "--output", str(out)]
+        )
+        assert result.exit_code == 0, result.output
+        assert "Report (json) written to" in result.output
+        assert json.loads(out.read_text(encoding="utf-8"))["summary"]["results"] == 16
+
+    def test_cli_pdf_missing_weasyprint(self, tmp_path):
+        from unittest.mock import patch
+        out = tmp_path / "report.pdf"
+        with patch("brickbench.report.render_pdf", side_effect=RuntimeError(
+            "PDF export requires 'weasyprint'. Install it via 'pip install .[pdf]' or run inside the brickbench container."
+        )):
+            result = CliRunner().invoke(
+                cli, ["report", "--db", str(FIXTURE), "--output", str(out), "--format", "pdf"]
+            )
+            assert result.exit_code != 0
+            assert "PDF export requires 'weasyprint'" in result.output
 
     def test_missing_db_exits_nonzero(self, tmp_path):
         result = CliRunner().invoke(

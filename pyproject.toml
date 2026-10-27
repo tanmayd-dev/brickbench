@@ -12,6 +12,9 @@ dependencies = [
     "tqdm>=4.60",
 ]
 
+[project.optional-dependencies]
+pdf = ["weasyprint>=60.0"]
+
 [project.scripts]
 brickbench = "brickbench.cli:cli"
 

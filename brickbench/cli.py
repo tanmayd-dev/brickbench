@@ -360,22 +360,35 @@ def export_cmd(output: str, format: str):
               help="Output file path (default: dist/index.html)")
 @click.option("--db", "db_path", type=str, default="data/runs/brickbench.db", show_default=True,
               required=False, help="SQLite database to read (default: data/runs/brickbench.db)")
-@click.option("--format", "fmt", type=click.Choice(["html", "json"]), default="html", show_default=True,
-              required=False, help="Render standalone HTML or the underlying JSON report")
+@click.option("--format", "fmt", type=click.Choice(["html", "json", "pdf"]), default="html", show_default=True,
+              required=False, help="Render standalone HTML, PDF, or the underlying JSON report")
 def report_cmd(output: str, db_path: str, fmt: str):
-    """Render a standalone benchmark report (HTML or JSON)."""
+    """Render a standalone benchmark report (HTML, JSON, or PDF)."""
     from pathlib import Path
-    from brickbench.report import collect_report, render_html, render_json
+    from brickbench.report import collect_report, render_html, render_json, render_pdf
 
     try:
         report = collect_report(db_path)
     except (FileNotFoundError, ValueError) as e:
         raise click.ClickException(str(e))
 
-    text = render_html(report) if fmt == "html" else render_json(report)
-    out_path = Path(output)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(text, encoding="utf-8")
+    if fmt == "html" and output.lower().endswith(".pdf"):
+        fmt = "pdf"
+    elif fmt == "html" and output.lower().endswith(".json"):
+        fmt = "json"
+
+    if fmt == "pdf":
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            render_pdf(report, out_path)
+        except RuntimeError as e:
+            raise click.ClickException(str(e))
+    else:
+        text = render_html(report) if fmt == "html" else render_json(report)
+        out_path = Path(output)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
 
     s = report["summary"]
     safety = "n/a" if s["safety_pass_pct"] is None else f"{s['safety_pass_pct']}%"

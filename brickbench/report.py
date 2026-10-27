@@ -22,6 +22,15 @@ from urllib.parse import quote as _quote
 
 from brickbench.config import __version__
 
+__all__ = [
+    "RUN_RESULTS_DDL",
+    "collect_report",
+    "record_run_result",
+    "render_html",
+    "render_json",
+    "render_pdf",
+]
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -402,6 +411,28 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 1
 .empty { color: var(--muted); background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; padding: 18px; }
 footer { margin-top: 36px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; }
 @media (max-width: 640px) { body { padding: 0 12px 32px; } .card strong { font-size: 24px; } th, td { padding: 7px 8px; } }
+@media print {
+  @page { size: A4; margin: 1.5cm 1.2cm; @bottom-right { content: "Page " counter(page) " of " counter(pages); font-size: 8pt; color: #64748b; } }
+  body { background: #ffffff !important; color: #0f172a !important; font-size: 11pt; padding: 0 !important; }
+  header { border-bottom: 1px solid #cbd5e1 !important; padding: 12px 0 !important; }
+  h1 { color: #0f172a !important; font-size: 20pt !important; }
+  h1 span { color: #059669 !important; }
+  .sub { color: #64748b !important; }
+  h2 { color: #475569 !important; font-size: 12pt !important; margin: 20px 0 8px !important; }
+  .card { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; break-inside: avoid; padding: 10px !important; }
+  .card .label { color: #64748b !important; }
+  .card strong { font-size: 20pt !important; color: #0f172a !important; }
+  .card.good strong { color: #059669 !important; }
+  .card.bad strong { color: #dc2626 !important; }
+  .card.warn strong { color: #d97706 !important; }
+  table { background: #ffffff !important; border: 1px solid #cbd5e1 !important; page-break-inside: auto; break-inside: auto; }
+  tr { page-break-inside: avoid; break-inside: avoid; }
+  th { background: #f1f5f9 !important; color: #475569 !important; border-bottom: 1px solid #cbd5e1 !important; }
+  td { border-bottom: 1px solid #e2e8f0 !important; color: #0f172a !important; font-size: 9pt !important; padding: 6px 8px !important; }
+  td.ok { color: #059669 !important; }
+  td.bad { color: #dc2626 !important; }
+  footer { border-top: 1px solid #cbd5e1 !important; color: #64748b !important; page-break-inside: avoid; }
+}
 """
 
 
@@ -566,3 +597,25 @@ def render_html(report: Dict[str, Any]) -> str:
 def render_json(report: Dict[str, Any]) -> str:
     """Render the same report dict as stable, indented JSON."""
     return _json.dumps(report, indent=2, sort_keys=False) + "\n"
+
+
+def render_pdf(report: Dict[str, Any], output_path: str | Path) -> None:
+    """Render a report dict to a PDF file using WeasyPrint.
+
+    Raises
+    ------
+    RuntimeError
+        When weasyprint is not installed.
+    """
+    try:
+        import weasyprint
+    except ImportError as e:
+        raise RuntimeError(
+            "PDF export requires 'weasyprint'. Install it via 'pip install .[pdf]' or run inside the brickbench container."
+        ) from e
+
+    html_content = render_html(report)
+    out_path = Path(output_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    weasyprint.HTML(string=html_content).write_pdf(target=str(out_path))
+

@@ -1,0 +1,13 @@
+.git
+.venv
+venv
+dist
+data/runs/*.db
+data/runs/*.db-wal
+data/runs/*.db-shm
+data/runs/transcript_*.json
+__pycache__
+*.pyc
+*.egg-info
+.pytest_cache
+.env

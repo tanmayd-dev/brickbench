@@ -69,7 +69,7 @@ scored against reality — either the learned safe-list (cheap) or a booted emul
 
 ```bash
 cp .env.example .env   # set OPENROUTER_API_KEY
-pip install -e .
+pip install -e ".[pdf]" # includes WeasyPrint for PDF reports
 ```
 
 Optional env overrides: `BRICKBENCH_AVD`, `BRICKBENCH_SNAPSHOT`, `BRICKBENCH_EMU_RAM_MB`.
@@ -89,20 +89,41 @@ brickbench report --db data/runs/brickbench.db \
 ### Report
 
 `brickbench report` turns a results database into a **single self-contained HTML
-file** — inline CSS, no scripts, no fonts, no network requests — so it opens
-directly from disk or from a GitHub Pages artifact.
+or publication-grade PDF file** — inline CSS with print media formatting, no scripts,
+no fonts, no network requests — so it opens directly from disk, prints cleanly to paper,
+or publishes as a GitHub Pages artifact.
 
 ```bash
-brickbench report --output dist/index.html                       # default DB
+brickbench report --output dist/index.html                       # default DB (HTML)
+brickbench report --output dist/report.pdf                        # standalone PDF (auto-detected)
 brickbench report --db data/fixtures/report_fixture.db \
-  --output /tmp/report.html                                     # any DB
+  --output dist/report.pdf --format pdf                          # explicit PDF format
+brickbench report --db data/fixtures/report_fixture.db \
+  --output /tmp/report.html                                     # any DB to HTML
 brickbench report --db data/fixtures/report_fixture.db \
   --output dist/report.json --format json                       # same data as JSON
 ```
 
 The query layer lives in `brickbench/report.py`: `collect_report(db)` returns one
-canonical dict and `render_html()` / `render_json()` only format it, so the two
-outputs can never disagree.
+canonical dict and `render_html()`, `render_pdf()`, and `render_json()` format it,
+so outputs can never disagree.
+
+### Podman & Containerized Execution
+
+brickbench can run completely containerized with Podman without requiring local
+Python dependencies or system libraries.
+
+```bash
+# Automated end-to-end run (builds image, evaluates matrix or fixture, outputs HTML and PDF to dist/):
+./scripts/run_pod.sh
+
+# Pass arbitrary CLI commands through the container:
+./scripts/run_pod.sh report --db data/fixtures/report_fixture.db --output dist/report.pdf
+
+# Or run declaratively via Podman / Kubernetes Pod:
+podman play kube pod.yaml
+podman play kube --down pod.yaml
+```
 
 | Field | Meaning |
 | ----- | ------- |
@@ -165,7 +186,7 @@ unsafe and the harness caught it. Lead with that, not with a happy path.
 | `resume` | Execute pending runs with emulator/LLM concurrency limits |
 | `reset` | Drop results (confirmation required) |
 | `export` | Dump runs + verdicts to JSON or CSV |
-| `report` | Render a standalone HTML (or JSON) report from a results DB |
+| `report` | Render a standalone HTML, PDF, or JSON report from a results DB |
 
 ## Project Structure
 
