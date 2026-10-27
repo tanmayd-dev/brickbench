@@ -164,7 +164,7 @@ def run_command(
     prompt_variants: Tuple[str, ...],
 ):
     """Enqueue the full brickbench matrix (no execution; `resume` runs it)."""
-    from brickbench.config import PROCESS_PROVIDERS, PROCESS_MODES, DEBLOAT_MODES, PACKAGES_PER_TARGET
+    from brickbench.config import PROCESS_PROVIDERS, PROCESS_MODES, DEBLOAT_MODES, PACKAGES_PER_TARGET, PROMPT_VARIANTS
 
     # Resolve target keys
     # Normalize space-separated arguments when passed as a single string
@@ -191,7 +191,7 @@ def run_command(
     if debloat_modes is None:
         debloat_modes = DEBLOAT_MODES
     if prompt_variants is None:
-        prompt_variants = ["baseline"]
+        prompt_variants = PROMPT_VARIANTS
 
 
     target_keys = list(targets) if targets else ["aosp-vanilla", "aosp-gapps", "aosp-play", "lineage-23.2", "e-os-gsi"]

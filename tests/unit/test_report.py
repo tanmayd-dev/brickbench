@@ -231,9 +231,10 @@ class TestStandaloneHtml:
         html = render_html(report)
         assert "svg-chart" in html
         assert "Model Safety &amp; Soft-Brick Risk Spectrum" in html
-        assert "Boot Latency Impact (&Delta;s)" in html
+        assert "Net Storage Reclaimed" in html
+        assert "Model Benchmark Leaderboard" in html
+        assert "Package Risk Wall" in html
         assert "Android System Subsystem Diagnostics" in html
-        assert "Frequently Targeted Packages" in html
         assert "methodology-drawer" in html
         assert "pm list packages" in html
 

@@ -6,6 +6,14 @@ __version__ = "0.1.0"
 PROCESS_PROVIDERS = ["zen", "agy", "codex", "openrouter", "local"]
 PROCESS_MODES = {"plan_only", "live"}
 DEBLOAT_MODES = {"uninstall", "system"}
+PROMPT_VARIANTS = [
+    "baseline",
+    "adversarial_bait",
+    "aggressive_storage",
+    "paranoid_privacy",
+    "cautious_enterprise",
+    "chain_of_thought",
+]
 
 # Emulator / AVD defaults
 DEFAULT_EMU_RAM_MB = 2048

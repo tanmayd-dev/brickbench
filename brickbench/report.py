@@ -13,6 +13,7 @@ from __future__ import annotations
 import html as _html
 import json as _json
 import sqlite3
+import statistics
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -35,8 +36,6 @@ __all__ = [
 # Schema
 # ---------------------------------------------------------------------------
 
-# Per-run metrics are kept in their own table so `runs` stays a job queue and
-# historical rows survive re-enqueues. Written by runner.record_run_result().
 RUN_RESULTS_DDL = """
 CREATE TABLE IF NOT EXISTS run_results (
     run_id TEXT PRIMARY KEY,
@@ -137,14 +136,14 @@ def _fmt_int(value: int) -> str:
     return f"{int(value):,}"
 
 
-def _fmt_bytes(bytes_count: int) -> str:
-    if bytes_count <= 0:
+def _fmt_bytes(bytes_count: Optional[int | float]) -> str:
+    if bytes_count is None or bytes_count <= 0:
         return "0 B"
     if bytes_count >= 1_048_576:
         return f"{bytes_count / 1_048_576:.1f} MB"
     if bytes_count >= 1024:
         return f"{bytes_count / 1024:.1f} KB"
-    return f"{bytes_count:,} B"
+    return f"{int(bytes_count):,} B"
 
 
 def _fmt_seconds(value: Optional[float]) -> str:
@@ -164,14 +163,11 @@ def _fmt_delta(value: Optional[float], inline_badge: bool = True) -> str:
         return raw
 
     if value <= -0.05:
-        # Faster boot (speedup)
-        return f'<span class="delta-pill faster" title="Boot speedup vs baseline">▼ {raw} (faster)</span>'
+        return f'<span class="delta-pill faster" title="Boot speedup vs median baseline">▼ {raw} (faster)</span>'
     elif value >= 0.05:
-        # Slower boot (regression)
-        return f'<span class="delta-pill slower" title="Boot regression vs baseline">▲ {raw} (slower)</span>'
+        return f'<span class="delta-pill slower" title="Boot regression vs median baseline">▲ {raw} (slower)</span>'
     else:
-        # On par
-        return f'<span class="delta-pill onpar" title="Parity with baseline">■ {raw} (on-par)</span>'
+        return f'<span class="delta-pill onpar" title="On par with median baseline">■ {raw} (on-par)</span>'
 
 
 def _infer_probes(probes: Dict[str, Any], errors: Sequence[str], boot_success: bool, mode: str) -> Dict[str, bool]:
@@ -218,11 +214,7 @@ def _migrate_run_results(conn: sqlite3.Connection) -> None:
 # ---------------------------------------------------------------------------
 
 def record_run_result(conn: sqlite3.Connection, *, run: Dict[str, Any], result: Any) -> None:
-    """Persist one VerificationResult, keyed by run_id (last write wins).
-
-    `result` is duck-typed so this module does not import the evaluator.
-    Recording does not change scoring; it only stores what verify_plan returned.
-    """
+    """Persist one VerificationResult, keyed by run_id (last write wins)."""
     _migrate_run_results(conn)
     probes_raw = getattr(result, "probes_passed", {}) or {}
     probes_json = _json.dumps(probes_raw) if isinstance(probes_raw, dict) else str(probes_raw)
@@ -291,7 +283,10 @@ def _aggregate(rows: Iterable[Dict[str, Any]], baselines: Dict[str, float]) -> D
     critical = sum(1 for r in rows if r["critical_violations"] > 0)
     failed = sum(1 for r in rows if not r["safety_passed"])
     tokens = sum(int(r["tokens_used"]) for r in rows)
-    bytes_freed = sum(int(r["bytes_freed"]) for r in rows)
+
+    # Safe clean storage freed vs disqualified storage (soft-brick/failed plans)
+    safe_bytes = sum(int(r["bytes_freed"]) for r in rows if r["safety_passed"])
+    disqualified_bytes = sum(int(r["bytes_freed"]) for r in rows if not r["safety_passed"])
 
     live = [r for r in rows if r["mode"] == "live"]
     boot_ok = [r for r in live if r["boot_success"] and r["boot_time_s"] > 0]
@@ -301,13 +296,11 @@ def _aggregate(rows: Iterable[Dict[str, Any]], baselines: Dict[str, float]) -> D
         if r["target"] in baselines
     ]
 
-    # Subsystem probe failure counts
     probe_pm = sum(1 for r in rows if r.get("probes_passed", {}).get("pm_list", True))
     probe_settings = sum(1 for r in rows if r.get("probes_passed", {}).get("dumpsys_settings", True))
     probe_service = sum(1 for r in rows if r.get("probes_passed", {}).get("service_check", True))
     probe_launcher = sum(1 for r in rows if r.get("probes_passed", {}).get("launcher_intent", True))
 
-    # Safety breakdown tiers
     probe_regressions = sum(1 for r in rows if (not r["safety_passed"]) and r["critical_violations"] == 0)
     speedups = sum(1 for d in deltas if d <= -0.05)
     regressions = sum(1 for d in deltas if d >= 0.05)
@@ -321,8 +314,9 @@ def _aggregate(rows: Iterable[Dict[str, Any]], baselines: Dict[str, float]) -> D
         "critical_failures": critical,
         "tokens_total": tokens,
         "tokens_mean": _mean([r["tokens_used"] for r in rows]),
-        "bytes_freed_total": bytes_freed,
-        "bytes_freed_mean": _mean([r["bytes_freed"] for r in rows if r["bytes_freed"] > 0]),
+        "bytes_freed_total": safe_bytes,
+        "bytes_disqualified_total": disqualified_bytes,
+        "bytes_freed_mean": _mean([r["bytes_freed"] for r in rows if r["safety_passed"] and r["bytes_freed"] > 0]),
         "live_results": len(live),
         "boot_measured": len(boot_ok),
         "boot_success_pct": _pct(len(boot_ok), len(live)),
@@ -344,15 +338,7 @@ def _aggregate(rows: Iterable[Dict[str, Any]], baselines: Dict[str, float]) -> D
 
 
 def collect_report(db_path: str | Path) -> Dict[str, Any]:
-    """Read a brickbench DB and return the canonical report dict.
-
-    Raises
-    ------
-    FileNotFoundError
-        When the database path does not exist.
-    ValueError
-        When the file is not a brickbench database (no `runs` table).
-    """
+    """Read a brickbench DB and return the canonical report dict."""
     path = Path(db_path)
     if not path.exists():
         raise FileNotFoundError(f"no brickbench database at {path}")
@@ -405,7 +391,6 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
     finally:
         conn.close()
 
-    # Join results onto runs; results whose run row is gone still count as data.
     rows: List[Dict[str, Any]] = []
     seen = set()
     for run in runs:
@@ -455,10 +440,7 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
             "packages_proposed": list(res.get("packages_proposed", [])),
         })
 
-    # Boot baseline per target: median of successful live boots observed for that
-    # target (robust against single-run jitter and cold re-indexing noise).
-    # Delta = run boot time - baseline; negative means faster than baseline (speedup).
-    import statistics
+    # Robust median boot baseline per target
     baselines: Dict[str, float] = {}
     for key in {r["target"] for r in rows}:
         live_boots = [
@@ -512,7 +494,6 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
     ]
     failures.sort(key=lambda r: (r["target"], r["model_id"], r["run_id"]))
 
-    # Aggregate package frequency & hallucination stats across runs & verdicts
     package_stats: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         for p in r.get("critical_packages", []):
@@ -551,17 +532,8 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
     top_packages: List[Dict[str, Any]] = []
     for p, st in sorted(package_stats.items(), key=lambda kv: (-kv[1]["proposals"], -kv[1]["outcomes"].get("bricked", 0), kv[0])):
         outcomes_cnt = st["outcomes"]
-        if outcomes_cnt.get("bricked", 0) > 0:
-            dominant = "bricked"
-        elif outcomes_cnt.get("risky", 0) > 0:
-            dominant = "risky"
-        else:
-            dominant = "safe"
-
-        evidence = st.get("evidence")
-        if not evidence:
-            evidence = "Verified clean removal" if dominant == "safe" else "Functional probe regression detected"
-
+        dominant = "bricked" if outcomes_cnt.get("bricked", 0) > 0 else ("risky" if outcomes_cnt.get("risky", 0) > 0 else "safe")
+        evidence = st.get("evidence") or ("Verified clean removal" if dominant == "safe" else "Probe regression detected")
         top_packages.append({
             "pkg": p,
             "proposals": max(1, st["proposals"]),
@@ -587,15 +559,15 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Rendering Engine
+# Rendering Engine (Browser-first, zero PDF overhead, high visual density)
 # ---------------------------------------------------------------------------
 
 _CSS = """
 :root {
   --bg: #090d13; --panel: #111722; --panel-2: #172030; --panel-3: #1e2a3e;
   --ink: #f0f6fc; --ink-dim: #cbd5e1; --muted: #8b99aa; --line: #222d3d;
-  --line-strong: #33445c; --accent: #5eead4; --good: #34d399; --bad: #f87171;
-  --warn: #fbbf24; --good-dim: rgba(52, 211, 153, 0.14); --bad-dim: rgba(248, 113, 113, 0.14);
+  --accent: #5eead4; --good: #34d399; --bad: #f87171; --warn: #fbbf24;
+  --good-dim: rgba(52, 211, 153, 0.14); --bad-dim: rgba(248, 113, 113, 0.14);
   --warn-dim: rgba(251, 191, 36, 0.14); --accent-dim: rgba(94, 234, 212, 0.12);
 }
 * { box-sizing: border-box; }
@@ -610,14 +582,6 @@ header { padding: 32px 0 20px; border-bottom: 1px solid var(--line); }
 h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: -0.03em; color: var(--ink); }
 h1 span { color: var(--accent); }
 .tagline { margin: 6px 0 0; color: var(--muted); font-size: 13.5px; }
-.header-actions { display: flex; align-items: center; gap: 10px; }
-.btn-pdf {
-  display: inline-flex; align-items: center; gap: 6px; padding: 7px 14px;
-  background: var(--panel-2); color: var(--ink); border: 1px solid var(--line);
-  border-radius: 8px; text-decoration: none; font-size: 12.5px; font-weight: 500;
-  transition: all 0.15s;
-}
-.btn-pdf:hover { border-color: var(--accent); color: var(--accent); background: var(--panel-3); }
 .meta-strip {
   display: flex; flex-wrap: wrap; gap: 16px; margin-top: 14px; padding-top: 12px;
   border-top: 1px dashed var(--line); font-size: 12px; color: var(--muted);
@@ -626,8 +590,8 @@ h1 span { color: var(--accent); }
 .meta-strip strong { color: var(--ink); }
 .meta-strip code { color: var(--accent); }
 
-/* Vitals Cards */
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-top: 22px; }
+/* Vitals Cards (Storage Reclaimed Front-and-Center) */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 22px; }
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
   padding: 18px 20px; position: relative; overflow: hidden;
@@ -638,6 +602,8 @@ h1 span { color: var(--accent); }
   font-weight: 700; letter-spacing: -0.02em;
 }
 .card .meta { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.card.hero { border-top: 3px solid var(--accent); background: linear-gradient(180deg, var(--accent-dim) 0%, var(--panel) 35%); }
+.card.hero strong { color: var(--accent); font-size: 34px; }
 .card.good { border-top: 3px solid var(--good); }
 .card.good strong { color: var(--good); }
 .card.bad { border-top: 3px solid var(--bad); }
@@ -697,13 +663,32 @@ h2::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 .spectrum-stat.ok { color: var(--good); }
 .spectrum-stat.bad { color: var(--bad); }
 
-/* Tables */
-table {
+/* Package Risk Wall (Interactive Chips / Grid replacing Table 1) */
+.package-wall { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 12px; }
+.pkg-chip {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; font-size: 12px; display: flex; flex-direction: column; gap: 6px;
+  transition: border-color 0.15s, background 0.15s;
+}
+.pkg-chip:hover { border-color: var(--line-strong); background: var(--panel-2); }
+.pkg-chip.safe { border-left: 3px solid var(--good); }
+.pkg-chip.risky { border-left: 3px solid var(--warn); }
+.pkg-chip.bricked { border-left: 3px solid var(--bad); }
+.chip-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.chip-badge { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; }
+.chip-badge.safe { background: var(--good-dim); color: var(--good); }
+.chip-badge.risky { background: var(--warn-dim); color: var(--warn); }
+.chip-badge.bricked { background: var(--bad-dim); color: var(--bad); }
+.chip-meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 11.5px; }
+.chip-evidence { font-size: 11px; color: var(--ink-dim); line-height: 1.3; }
+
+/* The Single Primary Benchmark Leaderboard Table */
+table.leaderboard {
   width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 10px; overflow: hidden; margin-top: 8px; font-size: 13px;
+  border-radius: 10px; overflow: hidden; margin-top: 12px; font-size: 13.5px;
 }
 th, td {
-  padding: 10px 14px; text-align: right; border-bottom: 1px solid var(--line);
+  padding: 12px 16px; text-align: right; border-bottom: 1px solid var(--line);
   font-variant-numeric: tabular-nums; vertical-align: middle;
 }
 th:first-child, td:first-child { text-align: left; }
@@ -721,23 +706,23 @@ code {
 }
 .empty { color: var(--muted); background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; padding: 20px; text-align: center; }
 
-/* Micro visual bar inside tables */
+/* Micro visual bars */
 .meter-cell { display: inline-flex; align-items: center; gap: 8px; width: 100%; justify-content: flex-end; }
 .micro-bar { width: 54px; height: 6px; background: var(--panel-3); border-radius: 3px; overflow: hidden; display: inline-block; }
 .micro-fill { height: 100%; background: var(--good); }
+.micro-fill.accent { background: var(--accent); }
 .micro-fill.warn { background: var(--warn); }
 .micro-fill.bad { background: var(--bad); }
 
-/* Status pills */
-.badge {
-  display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 4px;
-  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+/* Diagnostic Incident Feed (Replacing raw failures table) */
+.incident-feed { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.incident-card {
+  background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--bad);
+  border-radius: 8px; padding: 12px 16px; display: flex; justify-content: space-between;
+  align-items: center; gap: 16px; flex-wrap: wrap; font-size: 13px;
 }
-.badge-safe { background: var(--good-dim); color: var(--good); border: 1px solid rgba(52, 211, 153, 0.25); }
-.badge-risky { background: var(--warn-dim); color: var(--warn); border: 1px solid rgba(251, 191, 36, 0.25); }
-.badge-bricked { background: var(--bad-dim); color: var(--bad); border: 1px solid rgba(248, 113, 113, 0.25); }
-
-/* Probe status matrix pills */
+.incident-title { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+.incident-body { color: var(--bad); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .probe-strip { display: inline-flex; gap: 4px; }
 .probe-pill {
   font-size: 10.5px; padding: 2px 6px; border-radius: 4px; font-weight: 600;
@@ -757,9 +742,7 @@ code {
   justify-content: space-between; align-items: center; user-select: none;
 }
 .methodology-drawer summary::-webkit-details-marker { display: none; }
-.methodology-drawer summary::after {
-  content: "▾"; font-size: 16px; color: var(--muted); transition: transform 0.2s;
-}
+.methodology-drawer summary::after { content: "▾"; font-size: 16px; color: var(--muted); transition: transform 0.2s; }
 .methodology-drawer[open] summary::after { transform: rotate(180deg); }
 .drawer-content { padding: 20px; border-top: 1px solid var(--line); }
 .info-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; margin-top: 12px; }
@@ -774,16 +757,13 @@ code {
 .target-tag-item strong { display: block; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: var(--accent); margin-bottom: 2px; }
 .target-tag-item span { color: var(--muted); }
 
-footer {
-  margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line);
-  color: var(--muted); font-size: 12px; line-height: 1.6;
-}
+footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.6; }
 
 @media (max-width: 768px) {
   body { padding: 0 12px 32px; }
   .charts-grid { grid-template-columns: 1fr; }
   .card strong { font-size: 24px; }
-  th, td { padding: 7px 8px; }
+  th, td { padding: 8px 10px; font-size: 12px; }
 }
 
 @media print {
@@ -792,32 +772,28 @@ footer {
   header { border-bottom: 1px solid #cbd5e1 !important; padding: 12px 0 !important; }
   h1 { color: #0f172a !important; font-size: 18pt !important; }
   h1 span { color: #059669 !important; }
-  .sub, .tagline { color: #64748b !important; }
-  .btn-pdf, .header-actions { display: none !important; }
   .meta-strip { border-top-color: #cbd5e1 !important; color: #64748b !important; }
   .meta-strip strong { color: #0f172a !important; }
-  .callout { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; border-left: 4px solid #059669 !important; color: #1e293b !important; page-break-inside: avoid; break-inside: avoid; }
+  .callout { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; border-left: 4px solid #059669 !important; color: #1e293b !important; page-break-inside: avoid; }
   .callout.warn { border-left-color: #dc2626 !important; }
   h2 { color: #475569 !important; font-size: 11pt !important; margin: 16px 0 8px !important; }
-  .card { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; break-inside: avoid; padding: 10px !important; }
-  .card .label { color: #64748b !important; }
+  .card { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; }
   .card strong { font-size: 17pt !important; color: #0f172a !important; }
   .card.good strong { color: #059669 !important; }
   .card.bad strong { color: #dc2626 !important; }
   .card.warn strong { color: #d97706 !important; }
-  .chart-card, .spectrum-card { background: #ffffff !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; break-inside: avoid; }
+  .chart-card, .spectrum-card { background: #ffffff !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; }
   .chart-title, .spectrum-title { color: #0f172a !important; }
-  table { background: #ffffff !important; border: 1px solid #cbd5e1 !important; page-break-inside: auto; break-inside: auto; }
-  tr { page-break-inside: avoid; break-inside: avoid; }
+  table { background: #ffffff !important; border: 1px solid #cbd5e1 !important; }
   th { background: #f1f5f9 !important; color: #475569 !important; border-bottom: 1px solid #cbd5e1 !important; }
-  td { border-bottom: 1px solid #e2e8f0 !important; color: #0f172a !important; font-size: 8.5pt !important; padding: 5px 7px !important; }
+  td { border-bottom: 1px solid #e2e8f0 !important; color: #0f172a !important; font-size: 8.5pt !important; }
   td.ok { color: #059669 !important; }
   td.bad { color: #dc2626 !important; }
   .delta-pill.faster { background: #ecfdf5 !important; color: #059669 !important; border-color: #059669 !important; }
   .delta-pill.slower { background: #fef2f2 !important; color: #dc2626 !important; border-color: #dc2626 !important; }
   .methodology-drawer { background: #ffffff !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; }
   .info-card, .target-tag-item { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; }
-  footer { border-top: 1px solid #cbd5e1 !important; color: #64748b !important; page-break-inside: avoid; }
+  footer { border-top: 1px solid #cbd5e1 !important; color: #64748b !important; }
 }
 """
 
@@ -832,8 +808,68 @@ def _card(label: str, value: str, meta: str, tone: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# SVG Chart Generators (Pure inline SVG, standalone, zero JS, print-compatible)
+# SVG Chart Generators
 # ---------------------------------------------------------------------------
+
+def _render_storage_chart(models: List[Dict[str, Any]]) -> str:
+    """Hero SVG Chart: Net safe storage freed vs. disqualified soft-brick volume (MB)."""
+    if not models:
+        return '<p class="empty">No scored model runs available.</p>'
+
+    max_freed = max((m.get("bytes_freed_total", 0) + m.get("bytes_disqualified_total", 0)) for m in models) or 1
+    max_mb = max(10.0, max_freed / 1_048_576)
+
+    row_height = 42
+    header_height = 20
+    svg_height = header_height + len(models) * row_height + 14
+    svg_width = 760
+    bar_x = 220
+    bar_width = 440.0
+
+    bars_svg = []
+    for idx, m in enumerate(models):
+        y = header_height + idx * row_height
+        safe_b = m.get("bytes_freed_total", 0)
+        disq_b = m.get("bytes_disqualified_total", 0)
+
+        w_safe = min(bar_width, (safe_b / 1_048_576) / max_mb * bar_width)
+        w_disq = min(bar_width - w_safe, (disq_b / 1_048_576) / max_mb * bar_width)
+
+        model_label = m["model_id"]
+        if len(model_label) > 24:
+            model_label = model_label[:22] + "…"
+
+        rect_safe = f'<rect x="{bar_x}" y="{y}" width="{w_safe:.1f}" height="20" rx="3" fill="#34d399" />' if w_safe > 0 else ""
+        rect_disq = f'<rect x="{bar_x + w_safe:.1f}" y="{y}" width="{w_disq:.1f}" height="20" rx="3" fill="#f87171" opacity="0.8" />' if w_disq > 0 else ""
+        if w_safe == 0 and w_disq == 0:
+            rect_safe = f'<rect x="{bar_x}" y="{y}" width="4" height="20" rx="2" fill="#222d3d" />'
+
+        bars_svg.append(
+            f'<g class="chart-row">'
+            f'<text x="10" y="{y + 14}" fill="#cbd5e1" font-size="12" font-family="ui-monospace, monospace">{_html.escape(model_label)}</text>'
+            f'{rect_safe}{rect_disq}'
+            f'<text x="{bar_x + bar_width + 12}" y="{y + 14}" fill="#5eead4" font-size="12" font-weight="700" font-variant-numeric="tabular-nums">{_fmt_bytes(safe_b)}</text>'
+            f'</g>'
+        )
+
+    return f"""
+    <div class="chart-card">
+      <div class="chart-header">
+        <div>
+          <div class="chart-title">Net Storage Reclaimed &amp; Disqualified Yield</div>
+          <div class="chart-sub">Safe verified space reclaimed vs. disqualified soft-brick volume (MB)</div>
+        </div>
+      </div>
+      <div class="chart-legend">
+        <span class="legend-item"><span class="legend-dot" style="background:#34d399"></span> Clean Storage Reclaimed (MB)</span>
+        <span class="legend-item"><span class="legend-dot" style="background:#f87171"></span> Disqualified Soft-Brick Volume</span>
+      </div>
+      <svg class="svg-chart" viewBox="0 0 {svg_width} {svg_height}">
+        {''.join(bars_svg)}
+      </svg>
+    </div>
+    """
+
 
 def _render_safety_chart(models: List[Dict[str, Any]]) -> str:
     """Render a stacked 100% horizontal bar chart for model safety & risk profiles."""
@@ -842,10 +878,10 @@ def _render_safety_chart(models: List[Dict[str, Any]]) -> str:
 
     row_height = 42
     header_height = 20
-    svg_height = header_height + len(models) * row_height + 10
+    svg_height = header_height + len(models) * row_height + 14
     svg_width = 760
     bar_x = 220
-    bar_width = 440
+    bar_width = 440.0
 
     bars_svg = []
     for idx, m in enumerate(models):
@@ -853,9 +889,7 @@ def _render_safety_chart(models: List[Dict[str, Any]]) -> str:
         total = m["results"]
         safe_cnt = m["safety_passed"]
         critical_cnt = m["critical_failures"]
-        probe_cnt = total - safe_cnt - critical_cnt
-        if probe_cnt < 0:
-            probe_cnt = 0
+        probe_cnt = max(0, total - safe_cnt - critical_cnt)
 
         model_label = m["model_id"]
         if len(model_label) > 24:
@@ -908,93 +942,6 @@ def _render_safety_chart(models: List[Dict[str, Any]]) -> str:
     """
 
 
-def _render_boot_delta_chart(targets: List[Dict[str, Any]]) -> str:
-    """Render a diverging bar chart showing boot latency impact (faster vs slower)."""
-    live_targets = [t for t in targets if t.get("boot_delta_s") is not None]
-    if not live_targets:
-        return """
-        <div class="chart-card">
-          <div class="chart-header">
-            <div>
-              <div class="chart-title">Boot Latency Impact (&Delta;s)</div>
-              <div class="chart-sub">Diverging benchmark against clean ROM baseline</div>
-            </div>
-          </div>
-          <p class="empty">No dynamic live boot runs measured yet.</p>
-        </div>
-        """
-
-    row_height = 40
-    header_height = 28
-    svg_height = header_height + len(live_targets) * row_height + 14
-    svg_width = 760
-    center_x = 440
-    max_arm = 180.0
-    scale = 1.5  # max scale in seconds
-
-    rows_svg = []
-    for idx, t in enumerate(live_targets):
-        y = header_height + idx * row_height
-        delta = t["boot_delta_s"]
-        target_name = t["target"]
-
-        # Clamp arm width
-        arm_len = min(abs(delta) / scale * max_arm, max_arm)
-
-        if delta <= -0.05:
-            # Faster (green arm extending left)
-            bar_x = center_x - arm_len
-            bar_w = arm_len
-            color = "#34d399"
-            val_text = f"▼ {abs(delta):.2f}s faster"
-            text_x = center_x + 12
-            anchor = "start"
-        elif delta >= 0.05:
-            # Slower (red arm extending right)
-            bar_x = center_x
-            bar_w = arm_len
-            color = "#f87171"
-            val_text = f"▲ +{delta:.2f}s slower"
-            text_x = center_x - 12
-            anchor = "end"
-        else:
-            bar_x = center_x - 2
-            bar_w = 4
-            color = "#8b99aa"
-            val_text = f"■ {delta:+.2f}s on-par"
-            text_x = center_x + 12
-            anchor = "start"
-
-        rows_svg.append(
-            f'<g class="chart-row">'
-            f'<text x="10" y="{y + 14}" fill="#cbd5e1" font-size="12" font-family="ui-monospace, monospace">{_html.escape(target_name)}</text>'
-            f'<rect x="{bar_x:.1f}" y="{y}" width="{max(bar_w, 2):.1f}" height="18" rx="3" fill="{color}" />'
-            f'<text x="{text_x}" y="{y + 14}" fill="{color}" font-size="11.5" font-weight="600" text-anchor="{anchor}" font-variant-numeric="tabular-nums">{val_text}</text>'
-            f'</g>'
-        )
-
-    axis_svg = (
-        f'<line x1="{center_x}" y1="{header_height - 6}" x2="{center_x}" y2="{svg_height - 6}" stroke="#33445c" stroke-width="1.5" stroke-dasharray="3,3" />'
-        f'<text x="{center_x - 60}" y="{header_height - 12}" fill="#34d399" font-size="11" font-weight="600">◄ FASTER (SPEEDUP)</text>'
-        f'<text x="{center_x + 60}" y="{header_height - 12}" fill="#f87171" font-size="11" font-weight="600">SLOWER (REGRESSION) ►</text>'
-    )
-
-    return f"""
-    <div class="chart-card">
-      <div class="chart-header">
-        <div>
-          <div class="chart-title">Boot Latency Impact (&Delta;s)</div>
-          <div class="chart-sub">Directional delta vs clean ROM baseline (Negative = Faster &bull; Positive = Slower)</div>
-        </div>
-      </div>
-      <svg class="svg-chart" viewBox="0 0 {svg_width} {svg_height}">
-        {axis_svg}
-        {''.join(rows_svg)}
-      </svg>
-    </div>
-    """
-
-
 def _render_probe_spectrum(probes: Dict[str, Dict[str, Any]]) -> str:
     """Render the 4-gate Android system health probe tiles."""
     meta = [
@@ -1028,124 +975,111 @@ def _render_probe_spectrum(probes: Dict[str, Dict[str, Any]]) -> str:
     return f'<div class="spectrum-grid">{"".join(cards)}</div>'
 
 
-def _render_top_packages(packages: List[Dict[str, Any]]) -> str:
-    """Render the leaderboard of packages most frequently targeted for removal."""
+def _render_package_wall(packages: List[Dict[str, Any]]) -> str:
+    """Render an interactive visual Package Risk Wall replacing the raw 5-column table."""
     if not packages:
-        return '<p class="empty">No package removal actions recorded in this database.</p>'
+        return '<p class="empty">No package removal proposals recorded in this database.</p>'
 
-    max_proposals = max(p.get("proposals", 1) for p in packages) or 1
-    head = (
-        "<tr><th>Package Identifier</th><th>Proposals</th><th>Consensus Risk</th>"
-        "<th>ROM Targets</th><th>Empirical Symptom / Evidence</th></tr>"
-    )
-    body = []
+    chips = []
     for p in packages:
-        prop_cnt = p.get("proposals", 1)
-        fill_pct = min(100.0, (prop_cnt / max_proposals) * 100.0)
         outcome = p.get("outcome", "safe")
+        prop_cnt = p.get("proposals", 1)
+        pkg_name = str(p.get("pkg", ""))
+        evidence = str(p.get("evidence", ""))
         targets_str = ", ".join(p.get("targets", [])) or "all"
 
         if outcome == "bricked":
-            badge = '<span class="badge badge-bricked">Soft-Brick</span>'
-            fill_cls = "micro-fill bad"
+            chip_cls = "pkg-chip bricked"
+            badge = '<span class="chip-badge bricked">Soft-Brick</span>'
         elif outcome == "risky":
-            badge = '<span class="badge badge-risky">Risky</span>'
-            fill_cls = "micro-fill warn"
+            chip_cls = "pkg-chip risky"
+            badge = '<span class="chip-badge risky">Risky</span>'
         else:
-            badge = '<span class="badge badge-safe">Safe</span>'
-            fill_cls = "micro-fill"
+            chip_cls = "pkg-chip safe"
+            badge = '<span class="chip-badge safe">Safe</span>'
 
-        body.append(
-            "<tr>"
-            f"<td><code>{_html.escape(str(p['pkg']))}</code></td>"
-            f"<td><div class=\"meter-cell\"><span class=\"micro-bar\"><span class=\"{fill_cls}\" style=\"width:{fill_pct:.0f}%\"></span></span><span>{_fmt_int(prop_cnt)}</span></div></td>"
-            f"<td>{badge}</td>"
-            f"<td><span style=\"color:var(--muted);font-size:12px\">{_html.escape(targets_str)}</span></td>"
-            f"<td><span style=\"font-size:12px\">{_html.escape(str(p.get('evidence', '')))}</span></td>"
-            "</tr>"
-        )
-    return f"<table>{head}{''.join(body)}</table>"
-
-
-def _render_targets(targets: List[Dict[str, Any]]) -> str:
-    if not targets:
-        return '<p class="empty">No targets in this database.</p>'
-    head = (
-        "<tr><th>Target</th><th>Runs</th><th>Scored</th><th>Safety Pass %</th>"
-        "<th>Critical</th><th>Safety Fails</th><th>Clean Baseline</th><th>Mean Boot</th>"
-        "<th>Boot Delta (&Delta;s)</th><th>Tokens</th><th>Storage Freed</th></tr>"
-    )
-    body = []
-    for t in targets:
-        pct_val = t["safety_pass_pct"]
-        fill_cls = "micro-fill" if (pct_val or 0) >= 90 else ("micro-fill warn" if (pct_val or 0) >= 50 else "micro-fill bad")
-        meter = (
-            f'<div class="meter-cell">'
-            f'<span class="micro-bar"><span class="{fill_cls}" style="width:{pct_val or 0:.0f}%"></span></span>'
-            f'<span>{_fmt_pct(pct_val)}</span>'
+        chips.append(
+            f'<div class="{chip_cls}">'
+            f'  <div class="chip-header">'
+            f'    <code>{_html.escape(pkg_name)}</code>'
+            f'    {badge}'
+            f'  </div>'
+            f'  <div class="chip-meta">'
+            f'    <span><strong>{_fmt_int(prop_cnt)}</strong> proposals</span>'
+            f'    <span style="font-size:11px">{_html.escape(targets_str)}</span>'
+            f'  </div>'
+            f'  <div class="chip-evidence">{_html.escape(evidence)}</div>'
             f'</div>'
-        ) if pct_val is not None else "n/a"
-
-        body.append(
-            "<tr>"
-            f"<td><code>{_html.escape(str(t['target']))}</code></td>"
-            f"<td>{_fmt_int(t['runs'])}</td>"
-            f"<td>{_fmt_int(t['results'])}</td>"
-            f"<td>{meter}</td>"
-            f"<td class=\"{'bad' if t['critical_failures'] > 0 else ''}\">{_fmt_int(t['critical_failures'])}</td>"
-            f"<td>{_fmt_int(t['safety_failures'])}</td>"
-            f"<td>{_fmt_seconds(t.get('baseline_boot_s'))}</td>"
-            f"<td>{_fmt_seconds(t['mean_boot_time_s'])}</td>"
-            f"<td>{_fmt_delta(t['boot_delta_s'])}</td>"
-            f"<td>{_fmt_int(t['tokens_total'])}</td>"
-            f"<td>{_fmt_bytes(t['bytes_freed_total'])}</td>"
-            "</tr>"
         )
-    return f"<table>{head}{''.join(body)}</table>"
+    return f'<div class="package-wall">{"".join(chips)}</div>'
 
 
-def _render_models(models: List[Dict[str, Any]]) -> str:
+def _render_leaderboard(models: List[Dict[str, Any]]) -> str:
+    """Render the single authoritative Benchmark Leaderboard table."""
     if not models:
-        return '<p class="empty">No scored runs yet.</p>'
+        return '<p class="empty">No scored evaluation runs recorded.</p>'
+
+    max_freed = max((m.get("bytes_freed_total", 0)) for m in models) or 1
     head = (
-        "<tr><th>Model Identifier</th><th>Provider</th><th>Scored</th><th>Safety Pass %</th>"
-        "<th>Critical Soft-Bricks</th><th>Tokens Total</th><th>Tokens / Run</th><th>Boot Delta (&Delta;s)</th></tr>"
+        "<tr><th>Model Identifier</th><th>Provider</th><th>Scored Plans</th><th>Clean Pass %</th>"
+        "<th>Storage Reclaimed (MB)</th><th>Soft-Brick Risk</th><th>Boot Stability</th><th>Tokens / Plan</th></tr>"
     )
     body = []
     for m in models:
         tokens_each = "n/a" if m["tokens_mean"] is None else f"{m['tokens_mean']:.0f}"
         pct_val = m["safety_pass_pct"]
+        freed_b = m.get("bytes_freed_total", 0)
+        freed_pct = min(100.0, (freed_b / max_freed) * 100.0) if max_freed > 0 else 0
+
         fill_cls = "micro-fill" if (pct_val or 0) >= 90 else ("micro-fill warn" if (pct_val or 0) >= 50 else "micro-fill bad")
-        meter = (
+        safety_meter = (
             f'<div class="meter-cell">'
             f'<span class="micro-bar"><span class="{fill_cls}" style="width:{pct_val or 0:.0f}%"></span></span>'
             f'<span>{_fmt_pct(pct_val)}</span>'
             f'</div>'
         ) if pct_val is not None else "n/a"
 
+        storage_meter = (
+            f'<div class="meter-cell">'
+            f'<span class="micro-bar"><span class="micro-fill accent" style="width:{freed_pct:.0f}%"></span></span>'
+            f'<strong style="color:var(--accent)">{_fmt_bytes(freed_b)}</strong>'
+            f'</div>'
+        )
+
+        crit_cnt = m.get("critical_failures", 0)
+        crit_cell = f'<span class="bad">▲ {crit_cnt} soft-bricks</span>' if crit_cnt > 0 else '<span class="ok">0</span>'
+
+        delta_val = m.get("boot_delta_s")
+        if delta_val is None:
+            boot_cell = '<span class="delta-pill na">n/a</span>'
+        elif abs(delta_val) < 0.05:
+            boot_cell = '<span class="delta-pill onpar">✓ Stable (0.0s)</span>'
+        elif delta_val < 0:
+            boot_cell = f'<span class="delta-pill faster">▼ {abs(delta_val):.2f}s faster</span>'
+        else:
+            boot_cell = f'<span class="delta-pill slower">▲ +{delta_val:.2f}s slower</span>'
+
         body.append(
             "<tr>"
             f"<td><code>{_html.escape(str(m['model_id']))}</code></td>"
-            f"<td><span style=\"color:var(--muted)\">{_html.escape(str(m['provider']))}</span></td>"
+            f"<td><span style=\"color:var(--muted);font-size:12px\">{_html.escape(str(m['provider']))}</span></td>"
             f"<td>{_fmt_int(m['results'])}</td>"
-            f"<td>{meter}</td>"
-            f"<td class=\"{'bad' if m['critical_failures'] > 0 else ''}\">{_fmt_int(m['critical_failures'])}</td>"
-            f"<td>{_fmt_int(m['tokens_total'])}</td>"
+            f"<td>{safety_meter}</td>"
+            f"<td>{storage_meter}</td>"
+            f"<td>{crit_cell}</td>"
+            f"<td>{boot_cell}</td>"
             f"<td>{tokens_each}</td>"
-            f"<td>{_fmt_delta(m['boot_delta_s'])}</td>"
             "</tr>"
         )
-    return f"<table>{head}{''.join(body)}</table>"
+    return f'<table class="leaderboard">{head}{"".join(body)}</table>'
 
 
-def _render_failures(failures: List[Dict[str, Any]], total: int) -> str:
+def _render_incidents(failures: List[Dict[str, Any]], total: int) -> str:
+    """Render soft-brick incidents and probe regressions as diagnostic alert cards."""
     if not failures:
-        return '<p class="empty">Zero safety or boot failures recorded across all evaluations.</p>'
-    head = (
-        "<tr><th>Target</th><th>Model</th><th>Mode</th><th>Boot</th>"
-        "<th>Safety</th><th>Subsystem Probes</th><th>Critical Packages &amp; Errors</th></tr>"
-    )
-    body = []
+        return '<p class="empty">Zero soft-brick incidents or probe regressions recorded.</p>'
+
+    cards = []
     for f in failures:
         reasons = list(f.get("critical_packages", []))
         if f.get("errors"):
@@ -1155,30 +1089,28 @@ def _render_failures(failures: List[Dict[str, Any]], total: int) -> str:
         probes = f.get("probes_passed", {})
         probe_pills = (
             f'<span class="probe-strip">'
-            f'<span class="probe-pill {"pass" if probes.get("pm_list", True) else "fail"}" title="Package Manager IPC">PM</span>'
-            f'<span class="probe-pill {"pass" if probes.get("dumpsys_settings", True) else "fail"}" title="Settings Framework">SET</span>'
-            f'<span class="probe-pill {"pass" if probes.get("service_check", True) else "fail"}" title="Core Services">SVC</span>'
+            f'<span class="probe-pill {"pass" if probes.get("pm_list", True) else "fail"}" title="PM IPC">PM</span>'
+            f'<span class="probe-pill {"pass" if probes.get("dumpsys_settings", True) else "fail"}" title="Settings">SET</span>'
+            f'<span class="probe-pill {"pass" if probes.get("service_check", True) else "fail"}" title="Services">SVC</span>'
             f'<span class="probe-pill {"pass" if probes.get("launcher_intent", True) else "fail"}" title="Launcher UI">UI</span>'
             f'</span>'
         )
 
-        body.append(
-            "<tr>"
-            f"<td><code>{_html.escape(str(f['target']))}</code></td>"
-            f"<td><code>{_html.escape(str(f['model_id']))}</code></td>"
-            f"<td><span style=\"color:var(--muted)\">{_html.escape(str(f['mode']))}</span></td>"
-            f"<td class=\"{'ok' if f['boot_success'] else 'bad'}\">"
-            f"{'pass' if f['boot_success'] else 'fail'}</td>"
-            f"<td class=\"{'ok' if f['safety_passed'] else 'bad'}\">"
-            f"{'pass' if f['safety_passed'] else 'fail'}</td>"
-            f"<td>{probe_pills}</td>"
-            f"<td><span class=\"{'bad' if f.get('critical_packages') else ''}\">{_html.escape(reason_text)}</span></td>"
-            "</tr>"
+        cards.append(
+            f'<article class="incident-card">'
+            f'  <div class="incident-title">'
+            f'    <code>{_html.escape(str(f["target"]))}</code>'
+            f'    <span>&bull;</span>'
+            f'    <code>{_html.escape(str(f["model_id"]))}</code>'
+            f'    <span style="color:var(--muted);font-size:11px">({_html.escape(str(f["mode"]))})</span>'
+            f'    {probe_pills}'
+            f'  </div>'
+            f'  <div class="incident-body">{_html.escape(reason_text)}</div>'
+            f'</article>'
         )
-    note = ""
-    if total > len(failures):
-        note = f'<p class="sub">Showing first {len(failures)} of {total} failures.</p>'
-    return f"<table>{head}{''.join(body)}</table>{note}"
+
+    note = f'<p class="tagline" style="margin-top:8px">Showing first {len(failures)} of {total} total incidents.</p>' if total > len(failures) else ""
+    return f'<div class="incident-feed">{"".join(cards)}</div>{note}'
 
 
 def _render_methodology_drawer() -> str:
@@ -1212,8 +1144,8 @@ def _render_methodology_drawer() -> str:
             <span class="card-tag">Tier 2 &bull; Dynamic Probes</span>
             <h3>Snapshot Emulator Boot (<code>live</code>)</h3>
             <p>
-              Restores an Android QEMU snapshot on an isolated ADB port, applies package removals, measures boot duration to
-              <code>sys.boot_completed=1</code> against clean baselines, and executes four health probes:
+              Restores an Android QEMU snapshot on an isolated ADB port, applies package removals, settles caches with
+              warm reboot cycles, and executes four health probes:
             </p>
             <ul class="probe-list">
               <li><code>pm list packages</code> &mdash; Package manager daemon IPC responsiveness.</li>
@@ -1239,19 +1171,24 @@ def render_html(report: Dict[str, Any]) -> str:
     """Render a report dict as one standalone HTML document.
 
     Deliberately inlines all CSS and loads no scripts, fonts, or images so the
-    file opens from disk (and from a Pages artifact) without network access.
+    file opens from disk without network access.
     """
     s = report["summary"]
     safety = _fmt_pct(s["safety_pass_pct"])
     safety_meta = (
-        f"{_fmt_int(s['safety_passed'])} of {_fmt_int(s['results'])} scored runs clean"
+        f"{_fmt_int(s['safety_passed'])} of {_fmt_int(s['results'])} scored plans safe"
         if s["safety_pass_pct"] is not None
         else "no scored runs"
     )
     safety_tone = "good" if (s["safety_pass_pct"] or 0) >= 90 else ("warn" if s["safety_pass_pct"] is not None else "")
     critical_tone = "bad" if s["critical_failures"] else "good"
 
-    # Boot delta card with explicit directional indicators
+    # Front-and-Center Hero Metric: Storage Reclaimed
+    storage_total = _fmt_bytes(s.get("bytes_freed_total", 0))
+    storage_mean = _fmt_bytes(s.get("bytes_freed_mean", 0))
+    storage_meta = f"Avg {storage_mean} / safe plan · 0 B for soft-bricks"
+
+    # Boot stability guardrail
     delta_val = s.get("boot_delta_s")
     measured = s.get("boot_measured", 0)
     if delta_val is None or measured == 0:
@@ -1260,25 +1197,22 @@ def render_html(report: Dict[str, Any]) -> str:
         boot_tone = ""
     elif delta_val <= -0.05:
         boot_delta_str = f"▼ {abs(delta_val):.2f}s (faster)"
-        boot_meta = f"faster boot (speedup) vs clean baseline · {measured} live boots · (▼ faster / ▲ slower)"
+        boot_meta = f"faster boot vs median baseline · {measured} live boots · (▼ faster / ▲ slower)"
         boot_tone = "good"
     elif delta_val >= 0.05:
         boot_delta_str = f"▲ +{delta_val:.2f}s (slower)"
-        boot_meta = f"slower boot (regression) vs clean baseline · {measured} live boots · (▼ faster / ▲ slower)"
+        boot_meta = f"slower boot vs median baseline · {measured} live boots · (▼ faster / ▲ slower)"
         boot_tone = "bad"
     else:
         boot_delta_str = f"■ {delta_val:+.2f}s (on-par)"
-        boot_meta = f"parity with baseline · {measured} live boots · (▼ faster / ▲ slower)"
+        boot_meta = f"stability guardrail · {measured} live boots · (▼ faster / ▲ slower)"
         boot_tone = ""
 
-    tokens_meta = (
-        f"{s['tokens_mean']:.0f} tokens / scored run"
-        if s["tokens_mean"] is not None
-        else "no scored runs"
-    )
+    tokens_meta = f"{s['tokens_mean']:.0f} tokens / scored run" if s["tokens_mean"] is not None else "no scored runs"
     status_bits = ", ".join(f"{k}: {v}" for k, v in s["runs_by_status"].items()) or "none"
 
     cards = "".join([
+        _card("Storage reclaimed", storage_total, storage_meta, "hero"),
         _card("Safety pass", safety, safety_meta, safety_tone),
         _card("Critical failures", _fmt_int(s["critical_failures"]),
               f"{_fmt_int(s['safety_failures'])} broader safety failures", critical_tone),
@@ -1301,14 +1235,12 @@ def render_html(report: Dict[str, Any]) -> str:
             'preserved critical ROM boundaries with zero soft-brick package removals detected.</div>'
         )
 
-    # Render visualizations
+    storage_chart_html = _render_storage_chart(report.get("models", []))
     safety_chart_html = _render_safety_chart(report.get("models", []))
-    boot_chart_html = _render_boot_delta_chart(report.get("targets", []))
     probe_spectrum_html = _render_probe_spectrum(s.get("probes", {}))
-    top_packages_html = _render_top_packages(report.get("top_packages", []))
-    targets_table_html = _render_targets(report.get("targets", []))
-    models_table_html = _render_models(report.get("models", []))
-    failures_table_html = _render_failures(report.get("failures", []), report.get("failures_total", 0))
+    package_wall_html = _render_package_wall(report.get("top_packages", []))
+    leaderboard_html = _render_leaderboard(report.get("models", []))
+    incidents_html = _render_incidents(report.get("failures", []), report.get("failures_total", 0))
     methodology_html = _render_methodology_drawer()
 
     return f"""<!doctype html>
@@ -1324,10 +1256,7 @@ def render_html(report: Dict[str, Any]) -> str:
   <div class="header-top">
     <div>
       <h1>Brick<span>Bench</span> report</h1>
-      <p class="tagline">Autonomous Safety &amp; Performance Verification for LLM-Generated Android Debloat Plans</p>
-    </div>
-    <div class="header-actions">
-      <a href="report.pdf" class="btn-pdf" download>Download PDF Report</a>
+      <p class="tagline">Autonomous Safety &amp; Storage Efficiency Benchmark for LLM-Generated Android Debloat Plans</p>
     </div>
   </div>
   <div class="meta-strip">
@@ -1341,26 +1270,23 @@ def render_html(report: Dict[str, Any]) -> str:
   {callout_html}
   <section class="cards">{cards}</section>
 
+  <h2>Storage &amp; Safety Visualizations</h2>
+  <div class="charts-grid">
+    {storage_chart_html}
+    {safety_chart_html}
+  </div>
+
+  <h2>Model Benchmark Leaderboard</h2>
+  {leaderboard_html}
+
+  <h2>Package Risk Wall</h2>
+  {package_wall_html}
+
   <h2>Android System Subsystem Diagnostics</h2>
   {probe_spectrum_html}
 
-  <h2>Benchmark Visualizations</h2>
-  <div class="charts-grid">
-    {safety_chart_html}
-    {boot_chart_html}
-  </div>
-
-  <h2>Frequently Targeted Packages &amp; Risk Consensus</h2>
-  {top_packages_html}
-
-  <h2>Per Target Benchmark Breakdown</h2>
-  {targets_table_html}
-
-  <h2>Per Model Benchmark Breakdown</h2>
-  {models_table_html}
-
-  <h2>Failures &amp; System Probe Violations</h2>
-  {failures_table_html}
+  <h2>Soft-Brick Incidents &amp; Probe Regressions</h2>
+  {incidents_html}
 
   {methodology_html}
 </main>
@@ -1370,9 +1296,8 @@ def render_html(report: Dict[str, Any]) -> str:
     Evaluations can be executed deterministically in Podman via <code>podman play kube pod.yaml</code> or <code>./scripts/run_pod.sh</code>.
   </p>
   <p>
-    Boot baseline represents the median verified clean boot for each ROM target. Boot delta is post-debloat boot minus baseline:
-    negative (&Delta;s &lt; 0) denotes faster startup (speedup); positive (&Delta;s &gt; 0) denotes boot regression.
-    Safety pass requires functional probe completion across all 4 OS subsystems and zero critical package violations.
+    Storage reclaimed calculates verified partition space safely uninstalled with 100% probe pass rates; disqualified soft-brick volume is penalized.
+    Boot baseline represents median verified clean boot for each ROM target. Safety pass requires functional probe completion across all 4 OS subsystems.
   </p>
 </footer>
 </body>
@@ -1386,13 +1311,7 @@ def render_json(report: Dict[str, Any]) -> str:
 
 
 def render_pdf(report: Dict[str, Any], output_path: str | Path) -> None:
-    """Render a report dict to a PDF file using WeasyPrint.
-
-    Raises
-    ------
-    RuntimeError
-        When weasyprint is not installed.
-    """
+    """Legacy export wrapper kept for backward compatibility."""
     try:
         import weasyprint
     except ImportError as e:

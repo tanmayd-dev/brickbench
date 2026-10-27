@@ -6,6 +6,7 @@ from brickbench.config import (
     PROCESS_PROVIDERS,
     PROCESS_MODES,
     DEBLOAT_MODES,
+    PROMPT_VARIANTS,
     RATE_LIMITS,
     __version__,
 )
@@ -29,6 +30,11 @@ class TestModes:
 
     def test_debloat_modes(self):
         assert DEBLOAT_MODES == {"uninstall", "system"}
+
+    def test_prompt_variants(self):
+        assert "baseline" in PROMPT_VARIANTS
+        assert "adversarial_bait" in PROMPT_VARIANTS
+        assert "aggressive_storage" in PROMPT_VARIANTS
 
 
 class TestRateLimitsStructure:

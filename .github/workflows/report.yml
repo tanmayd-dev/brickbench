@@ -60,7 +60,6 @@ jobs:
           echo "Rendering from $DB"
           mkdir -p dist
           brickbench report --db "$DB" --output dist/index.html
-          brickbench report --db "$DB" --output dist/report.pdf --format pdf
           touch dist/.nojekyll
 
       - name: Upload Pages artifact
