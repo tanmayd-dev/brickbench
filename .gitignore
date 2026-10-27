@@ -17,6 +17,9 @@ data/runs/*.db-shm
 data/runs/transcript_*.json
 data/exports/
 
+# Generated report output
+dist/
+
 # Secrets / local config
 .env
 .env.local

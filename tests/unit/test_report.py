@@ -1,0 +1,236 @@
+"""Tests for the report query/rendering layer and the `report` CLI command."""
+
+import json
+import re
+import sqlite3
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+from click.testing import CliRunner
+
+from brickbench.cli import cli
+from brickbench.report import (
+    RUN_RESULTS_DDL,
+    collect_report,
+    record_run_result,
+    render_html,
+    render_json,
+)
+
+FIXTURE = Path(__file__).resolve().parents[2] / "data" / "fixtures" / "report_fixture.db"
+
+RUNS_DDL = """
+CREATE TABLE IF NOT EXISTS runs (
+    run_id TEXT PRIMARY KEY,
+    target TEXT NOT NULL,
+    model_id TEXT NOT NULL,
+    provider TEXT NOT NULL DEFAULT 'zen',
+    prompt_variant TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    debloat_mode TEXT NOT NULL,
+    plan_hash TEXT NOT NULL,
+    result_hash TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL DEFAULT (julianday('now')),
+    updated_at REAL DEFAULT (julianday('now'))
+)
+"""
+
+
+def _build_db(path: Path, rows):
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(RUNS_DDL)
+        conn.executescript(RUN_RESULTS_DDL)
+        for i, row in enumerate(rows):
+            run_id = f"run-{i}"
+            conn.execute(
+                "INSERT INTO runs (run_id, target, model_id, provider, prompt_variant, mode, "
+                "debloat_mode, plan_hash, status) VALUES (?, ?, 'm', 'p', 'baseline', "
+                "?, 'uninstall', ?, 'done')",
+                (run_id, row["target"], row["mode"], f"h{i}"),
+            )
+            conn.execute(
+                "INSERT INTO run_results (run_id, target, model_id, provider, prompt_variant, "
+                "mode, debloat_mode, boot_success, boot_time_s, safety_passed, "
+                "critical_violations, critical_packages, bytes_freed, tokens_used, errors, "
+                "recorded_at) VALUES (?, ?, 'm', 'p', 'baseline', ?, 'uninstall', ?, ?, ?, ?, "
+                "?, 0, ?, '[]', 1.0)",
+                (
+                    run_id, row["target"], row["mode"], int(row.get("boot_ok", True)),
+                    row.get("boot_s", 0.0), int(row.get("safe", True)),
+                    len(row.get("critical", [])), json.dumps(row.get("critical", [])),
+                    row.get("tokens", 0),
+                ),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class TestFixtureReport:
+    def test_fixture_exists_and_has_scores(self):
+        assert FIXTURE.exists(), "run python scripts/make_fixture_db.py"
+        report = collect_report(FIXTURE)
+        assert report["summary"]["runs"] >= 10
+        assert report["summary"]["results"] >= 10
+        assert report["targets"]
+        assert report["models"]
+
+    def test_fixture_metrics(self):
+        s = collect_report(FIXTURE)["summary"]
+        assert s["results"] == 16
+        assert s["safety_passed"] == 14
+        assert s["safety_pass_pct"] == 87.5
+        assert s["critical_failures"] == 2
+        assert s["tokens_total"] == 11604
+        assert s["boot_measured"] == 7
+        assert s["boot_delta_s"] is not None
+
+    def test_json_and_html_share_one_report(self):
+        report = collect_report(FIXTURE)
+        payload = json.loads(render_json(report))
+        assert payload == report
+        html = render_html(report)
+        assert payload["summary"]["safety_pass_pct"] == report["summary"]["safety_pass_pct"]
+        assert "87.5%" in html
+        assert "11,604" in html
+
+
+class TestDerivedMetrics:
+    def test_boot_delta_uses_fastest_successful_boot(self, tmp_path):
+        db = tmp_path / "bench.db"
+        _build_db(db, [
+            {"target": "t", "mode": "live", "boot_ok": True, "boot_s": 10.0, "tokens": 100},
+            {"target": "t", "mode": "live", "boot_ok": True, "boot_s": 12.0, "tokens": 200},
+            {"target": "t", "mode": "live", "boot_ok": False, "boot_s": 11.0, "tokens": 300},
+        ])
+        report = collect_report(db)
+        s = report["summary"]
+        assert s["boot_measured"] == 2
+        assert s["live_results"] == 3
+        assert s["boot_success_pct"] == 66.7
+        assert s["boot_delta_s"] == 1.0  # (10-10 + 12-10) / 2
+        assert s["tokens_total"] == 600
+        assert report["targets"][0]["baseline_boot_s"] == 10.0
+
+    def test_critical_and_safety_failures_are_distinct(self, tmp_path):
+        db = tmp_path / "bench.db"
+        _build_db(db, [
+            {"target": "t", "mode": "plan_only", "safe": True},
+            {"target": "t", "mode": "plan_only", "safe": False,
+             "critical": ["com.android.systemui"]},
+        ])
+        s = collect_report(db)["summary"]
+        assert s["safety_pass_pct"] == 50.0
+        assert s["safety_failures"] == 1
+        assert s["critical_failures"] == 1
+        assert collect_report(db)["failures"][0]["critical_packages"] == ["com.android.systemui"]
+
+    def test_missing_db_is_a_friendly_error(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            collect_report(tmp_path / "nope.db")
+
+    def test_not_a_brickbench_db(self, tmp_path):
+        db = tmp_path / "other.db"
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.execute("CREATE TABLE unrelated (x INTEGER)")
+            conn.commit()
+        finally:
+            conn.close()
+        with pytest.raises(ValueError):
+            collect_report(db)
+
+    def test_record_run_result_round_trips(self, tmp_path):
+        db = tmp_path / "bench.db"
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.executescript(RUN_RESULTS_DDL)
+            result = SimpleNamespace(
+                boot_success=True, boot_time_s=9.5, safety_passed=False,
+                critical_violations=["com.android.phone"], bytes_freed=123,
+                tokens_used=77, errors=["telephony probe failed"],
+            )
+            record_run_result(
+                conn,
+                run={"run_id": "r1", "target": "t", "model_id": "m", "provider": "p",
+                     "prompt_variant": "baseline", "mode": "live",
+                     "debloat_mode": "uninstall"},
+                result=result,
+            )
+            row = conn.execute("SELECT * FROM run_results WHERE run_id='r1'").fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "r1"
+        assert row[9] == 0  # safety_passed -> int
+        assert json.loads(row[11]) == ["com.android.phone"]
+        assert row[13] == 77
+
+    def test_runner_step_feeds_the_report(self, tmp_path, monkeypatch):
+        """A real runner step → evaluator → report round trip, with the LLM stubbed."""
+        import brickbench.runner as runner_mod
+
+        monkeypatch.setattr(runner_mod, "_dispatch_model", lambda *a, **k: ("[]", 42))
+        runner = runner_mod.Runner(data_dir=tmp_path)
+        try:
+            runner.enqueue(
+                target_key="aosp-vanilla", model_id="stub-model",
+                prompt_variant="baseline", mode="plan_only",
+                debloat_mode="uninstall", provider="local",
+            )
+            assert runner.step() == 1
+        finally:
+            runner.close()
+
+        s = collect_report(tmp_path / "brickbench.db")["summary"]
+        assert s["runs"] == 1
+        assert s["results"] == 1
+        assert s["tokens_total"] == 42
+
+
+class TestStandaloneHtml:
+    def test_no_external_or_absolute_references(self):
+        html = render_html(collect_report(FIXTURE))
+        low = html.lower()
+        assert "<script" not in low
+        assert not re.search(r"<link\b", low)
+        assert "http://" not in low
+        assert "https://" not in low
+        assert "/home/" not in html
+        assert "/users/" not in low
+        assert "file://" not in low
+        assert "<style>" in low
+
+    def test_renders_required_metrics(self):
+        html = render_html(collect_report(FIXTURE))
+        for label in ("Safety pass", "Critical failures", "Boot delta", "Token spend"):
+            assert label in html
+
+
+class TestReportCli:
+    def test_html_output(self, tmp_path):
+        out = tmp_path / "dist" / "index.html"
+        result = CliRunner().invoke(
+            cli, ["report", "--db", str(FIXTURE), "--output", str(out)]
+        )
+        assert result.exit_code == 0, result.output
+        assert out.exists()
+        assert "Safety pass" in out.read_text(encoding="utf-8")
+        assert "87.5%" in result.output
+
+    def test_json_output(self, tmp_path):
+        out = tmp_path / "report.json"
+        result = CliRunner().invoke(
+            cli, ["report", "--db", str(FIXTURE), "--output", str(out), "--format", "json"]
+        )
+        assert result.exit_code == 0, result.output
+        assert json.loads(out.read_text(encoding="utf-8"))["summary"]["results"] == 16
+
+    def test_missing_db_exits_nonzero(self, tmp_path):
+        result = CliRunner().invoke(
+            cli, ["report", "--db", str(tmp_path / "nope.db"), "--output", str(tmp_path / "x.html")]
+        )
+        assert result.exit_code != 0
+        assert "no brickbench database" in result.output

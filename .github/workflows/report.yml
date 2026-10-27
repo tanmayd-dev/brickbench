@@ -1,0 +1,66 @@
+name: report
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: report-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    env:
+      # Optional: when this secret is absent the job still publishes a report
+      # from the committed fixture instead of making live model calls.
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Enqueue fast plan_only matrix
+        if: env.OPENROUTER_API_KEY != ''
+        run: |
+          brickbench run \
+            --providers openrouter \
+            --targets aosp-vanilla \
+            --modes plan_only \
+            --debloat-modes uninstall \
+            --prompt-variants baseline
+
+      - name: Execute a few plan_only cells
+        if: env.OPENROUTER_API_KEY != ''
+        run: brickbench resume --max-llm 2 --max-steps 3
+
+      - name: Render report
+        run: |
+          DB=data/fixtures/report_fixture.db
+          COUNT=0
+          if [ -f data/runs/brickbench.db ]; then
+            COUNT=$(python -c "import sqlite3; c=sqlite3.connect('data/runs/brickbench.db'); print(c.execute('select count(*) from run_results').fetchone()[0])" 2>/dev/null || echo 0)
+          fi
+          if [ "${COUNT:-0}" -gt 0 ]; then
+            DB=data/runs/brickbench.db
+          fi
+          echo "Rendering from $DB"
+          brickbench report --db "$DB" --output dist/index.html
+          mkdir -p dist
+          touch dist/.nojekyll
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist

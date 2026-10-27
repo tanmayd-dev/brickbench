@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from brickbench.evaluator import verify_plan
+from brickbench.report import RUN_RESULTS_DDL, record_run_result
 
 # ---------------------------------------------------------------------------
 # SQLite state store helpers
@@ -67,6 +68,7 @@ def _sqlite_conn(data_dir: any) -> sqlite3.Connection:
             conn.commit()
     except sqlite3.OperationalError:
         pass
+    conn.executescript(RUN_RESULTS_DDL)
     return conn
 
 
@@ -583,7 +585,7 @@ class Runner:
 
         plan_hash = "fake_hash_" + prompt_variant
 
-        verify_plan(
+        result = verify_plan(
             target_key=target_key,
             plan_hash=plan_hash,
             plan_actions=plan_actions or [{"pkg": "com.example.app", "action": "uninstall"}],
@@ -597,6 +599,7 @@ class Runner:
             llm_reply=llm_reply,
             plan_source="llm" if plan_actions else "heuristic",
         )
+        record_run_result(conn, run=run, result=result)
 
     # ------------------------------------------------------------------
     # Live path (emulator)
@@ -623,7 +626,7 @@ class Runner:
             {"pkg": "com.android.dreams.basic", "action": "uninstall"},
         ]
 
-        verify_plan(
+        result = verify_plan(
             target_key=target_key,
             plan_hash="emu_" + prompt_variant,
             plan_actions=plan_actions,
@@ -642,3 +645,4 @@ class Runner:
             llm_reply=llm_reply,
             plan_source="llm" if llm_reply else "heuristic",
         )
+        record_run_result(conn, run=run, result=result)

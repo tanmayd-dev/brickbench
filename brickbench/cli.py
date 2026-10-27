@@ -30,6 +30,8 @@ def init_cmd():
     from pathlib import Path
     import sqlite3
 
+    from brickbench.report import RUN_RESULTS_DDL
+
     base = Path("data/runs")
     base.mkdir(parents=True, exist_ok=True)
     db_path = base / "brickbench.db"
@@ -61,6 +63,7 @@ def init_cmd():
         );
         """
     )
+    conn.executescript(RUN_RESULTS_DDL)
     conn.close()
     click.echo("Initialized brickbench state at " + str(base / "brickbench.db"))
 
@@ -350,6 +353,37 @@ def export_cmd(output: str, format: str):
         click.echo(f"✅ Exported {cur.rowcount} verdict records to {verdicts_output}")
 
     conn.close()
+
+
+@cli.command("report")
+@click.option("--output", type=str, default="dist/index.html", show_default=True, required=False,
+              help="Output file path (default: dist/index.html)")
+@click.option("--db", "db_path", type=str, default="data/runs/brickbench.db", show_default=True,
+              required=False, help="SQLite database to read (default: data/runs/brickbench.db)")
+@click.option("--format", "fmt", type=click.Choice(["html", "json"]), default="html", show_default=True,
+              required=False, help="Render standalone HTML or the underlying JSON report")
+def report_cmd(output: str, db_path: str, fmt: str):
+    """Render a standalone benchmark report (HTML or JSON)."""
+    from pathlib import Path
+    from brickbench.report import collect_report, render_html, render_json
+
+    try:
+        report = collect_report(db_path)
+    except (FileNotFoundError, ValueError) as e:
+        raise click.ClickException(str(e))
+
+    text = render_html(report) if fmt == "html" else render_json(report)
+    out_path = Path(output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(text, encoding="utf-8")
+
+    s = report["summary"]
+    safety = "n/a" if s["safety_pass_pct"] is None else f"{s['safety_pass_pct']}%"
+    click.echo(
+        f"✅ Report ({fmt}) written to {out_path} — "
+        f"{s['results']} scored / {s['runs']} runs, "
+        f"safety {safety}, {s['tokens_total']} tokens"
+    )
 
 
 # ---------------------------------------------------------------------------

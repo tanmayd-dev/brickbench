@@ -82,7 +82,56 @@ brickbench run --providers openrouter local \         # enqueue evaluation matri
   --modes plan_only live
 brickbench resume --max-emulator 1 --max-llm 4        # execute pending runs
 brickbench export --format json --output results.json # dump results
+brickbench report --db data/runs/brickbench.db \
+  --output dist/index.html                            # render static report
 ```
+
+### Report
+
+`brickbench report` turns a results database into a **single self-contained HTML
+file** — inline CSS, no scripts, no fonts, no network requests — so it opens
+directly from disk or from a GitHub Pages artifact.
+
+```bash
+brickbench report --output dist/index.html                       # default DB
+brickbench report --db data/fixtures/report_fixture.db \
+  --output /tmp/report.html                                     # any DB
+brickbench report --db data/fixtures/report_fixture.db \
+  --output dist/report.json --format json                       # same data as JSON
+```
+
+The query layer lives in `brickbench/report.py`: `collect_report(db)` returns one
+canonical dict and `render_html()` / `render_json()` only format it, so the two
+outputs can never disagree.
+
+| Field | Meaning |
+| ----- | ------- |
+| **Safety pass** | `safety_passed` scored runs ÷ all scored runs. A run passes when functional probes and critical-package checks pass. |
+| **Critical failures** | Scored runs that removed at least one package from the target's critical set. |
+| **Boot delta** | Mean `boot_time_s` change against that target's fastest successful live boot (negative = faster). `plan_only` runs have no boot measurement. |
+| **Token spend** | Sum of `tokens_used` across scored runs, plus the mean per run. |
+| Scored / enqueued | Runs with a `run_results` row vs. all rows in `runs` (includes `pending` and `skipped`). |
+| Per-target table | Runs, scored, safety %, critical failures, mean boot, boot delta, tokens, bytes freed. |
+| Per-model table | Scored runs, safety %, critical failures, token total and per run, boot delta. |
+| Failures table | Safety/boot failures with the offending critical packages and probe errors. |
+
+`resume` writes one `run_results` row per executed cell (via
+`report.record_run_result()`); the JSON report is the same dict the HTML uses:
+`schema_version`, `generated_at`, `tool_version`, `database`, `summary`,
+`targets`, `models`, `failures`, `verdicts`.
+
+**Fixture.** `data/fixtures/report_fixture.db` is a small, deterministic,
+secret-free database used by the tests and by CI when no model credentials are
+configured. Regenerate it (never hand-edit it) with:
+
+```bash
+python scripts/make_fixture_db.py
+```
+
+CI (`.github/workflows/report.yml`) renders the report on every push to `main`
+and uploads `dist/` as a Pages artifact. When `OPENROUTER_API_KEY` is present it
+first executes three `plan_only` cells against `aosp-vanilla`; otherwise it
+renders the fixture so the artifact is always non-empty.
 
 ### Test
 
@@ -116,14 +165,18 @@ unsafe and the harness caught it. Lead with that, not with a happy path.
 | `resume` | Execute pending runs with emulator/LLM concurrency limits |
 | `reset` | Drop results (confirmation required) |
 | `export` | Dump runs + verdicts to JSON or CSV |
+| `report` | Render a standalone HTML (or JSON) report from a results DB |
 
 ## Project Structure
 
 ```
 brickbench/
-├── cli.py        # Click commands: init, run, resume, reset, export
+├── cli.py        # Click commands: init, run, resume, reset, export, report
 ├── config.py     # Version, providers, modes, ROM targets, rate limits
 ├── runner.py     # Run orchestration, model dispatch, concurrency
+├── report.py     # Report query layer + HTML/JSON rendering
 └── evaluator.py  # Plan verification (static + emulator) and scoring
-tests/unit/       # Config + evaluator tests
+data/fixtures/    # Deterministic report fixture DB (regenerate via scripts/)
+scripts/          # make_fixture_db.py
+tests/unit/       # Config, evaluator, and report tests
 ```
