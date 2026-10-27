@@ -12,10 +12,7 @@ venv/
 .venv/
 
 # Runtime state (rebuilt via `brickbench init` / runs)
-data/runs/*.db
-data/runs/*.db-wal
-data/runs/*.db-shm
-data/runs/transcript_*.json
+data/runs/
 data/exports/
 
 # Generated report output

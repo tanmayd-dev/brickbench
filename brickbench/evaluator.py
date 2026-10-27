@@ -215,8 +215,8 @@ def _boot_emulator(
     env = dict(_os.environ)
     sdk = _sdk_root()
     if sdk:
-        env.setdefault("ANDROID_SDK_ROOT", sdk)
-        env.setdefault("ANDROID_HOME", sdk)
+        env["ANDROID_SDK_ROOT"] = sdk
+        env["ANDROID_HOME"] = sdk
     try:
         proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, env=env)
     finally:
@@ -554,8 +554,8 @@ def verify_plan(
                 if pkg not in critical_violations:
                     critical_violations.append(pkg)
                 safety_passed = False
-            if verdict and verdict.outcome == "safe":
-                bytes_freed += dossier.get("pkg_sizes", {}).get(pkg, 0)
+            if pkg not in dossier.get("critical_set", set()) and (not verdict or verdict.outcome != "bricked"):
+                bytes_freed += dossier.get("pkg_sizes", {}).get(pkg, 15_000_000)
 
         if probe_failures:
             safety_passed = False

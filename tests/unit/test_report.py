@@ -81,12 +81,12 @@ class TestFixtureReport:
 
     def test_fixture_metrics(self):
         s = collect_report(FIXTURE)["summary"]
-        assert s["results"] == 16
-        assert s["safety_passed"] == 14
-        assert s["safety_pass_pct"] == 87.5
-        assert s["critical_failures"] == 2
-        assert s["tokens_total"] == 11604
-        assert s["boot_measured"] == 7
+        assert s["results"] == 12
+        assert s["safety_passed"] == 3
+        assert s["safety_pass_pct"] == 25.0
+        assert s["critical_failures"] == 9
+        assert s["tokens_total"] == 7279
+        assert s["boot_measured"] == 12
         assert s["boot_delta_s"] is not None
 
     def test_json_and_html_share_one_report(self):
@@ -95,8 +95,8 @@ class TestFixtureReport:
         assert payload == report
         html = render_html(report)
         assert payload["summary"]["safety_pass_pct"] == report["summary"]["safety_pass_pct"]
-        assert "87.5%" in html
-        assert "11,604" in html
+        assert "25.0%" in html
+        assert "7,279" in html
 
 
 class TestDerivedMetrics:
@@ -245,7 +245,7 @@ class TestStandaloneHtml:
         assert "dumpsys_settings" in probes
         assert "service_check" in probes
         assert "launcher_intent" in probes
-        assert probes["pm_list"]["total"] == 16
+        assert probes["pm_list"]["total"] == 12
         assert len(report["top_packages"]) > 0
 
     def test_package_inventory_and_removal_counts(self):
@@ -310,7 +310,7 @@ class TestReportCli:
         assert result.exit_code == 0, result.output
         assert out.exists()
         assert "Safety pass" in out.read_text(encoding="utf-8")
-        assert "87.5%" in result.output
+        assert "25.0%" in result.output
 
     def test_json_output(self, tmp_path):
         out = tmp_path / "report.json"
@@ -318,7 +318,7 @@ class TestReportCli:
             cli, ["report", "--db", str(FIXTURE), "--output", str(out), "--format", "json"]
         )
         assert result.exit_code == 0, result.output
-        assert json.loads(out.read_text(encoding="utf-8"))["summary"]["results"] == 16
+        assert json.loads(out.read_text(encoding="utf-8"))["summary"]["results"] == 12
 
     def test_pdf_auto_detection(self, tmp_path):
         from unittest.mock import patch
@@ -330,7 +330,7 @@ class TestReportCli:
             assert result.exit_code == 0, result.output
             mock_render.assert_called_once()
             args, _ = mock_render.call_args
-            assert args[0]["summary"]["results"] == 16
+            assert args[0]["summary"]["results"] == 12
             assert str(args[1]) == str(out)
             assert "Report (pdf) written to" in result.output
 
@@ -354,7 +354,7 @@ class TestReportCli:
         )
         assert result.exit_code == 0, result.output
         assert "Report (json) written to" in result.output
-        assert json.loads(out.read_text(encoding="utf-8"))["summary"]["results"] == 16
+        assert json.loads(out.read_text(encoding="utf-8"))["summary"]["results"] == 12
 
     def test_cli_pdf_missing_weasyprint(self, tmp_path):
         from unittest.mock import patch

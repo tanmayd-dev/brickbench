@@ -75,6 +75,29 @@ PACKAGES_PER_TARGET = {
     ],
 }
 
+PACKAGE_SIZES = {
+    "com.google.android.youtube": 128_000_000,
+    "com.google.android.apps.maps": 96_000_000,
+    "com.google.android.gm": 68_000_000,
+    "com.android.browser": 45_000_000,
+    "com.android.email": 32_000_000,
+    "com.android.calendar": 28_000_000,
+    "com.google.android.gms": 195_000_000,
+    "com.google.android.gsf": 18_000_000,
+    "com.google.android.vending": 75_000_000,
+    "com.android.printspooler": 14_000_000,
+    "com.android.dreams.basic": 8_500_000,
+    "com.android.dialer": 36_000_000,
+    "com.android.contacts": 42_000_000,
+    "com.android.mms": 24_000_000,
+    "com.android.settings": 58_000_000,
+    "com.android.systemui": 72_000_000,
+    "com.android.phone": 48_000_000,
+    "org.lineageos.updater": 12_000_000,
+    "com.eos.gsi": 15_000_000,
+    "com.oem.partner": 22_000_000,
+}
+
 # Rate-limit guardrails (per-provider; enforced in runner)
 RATE_LIMITS = {
     "openrouter": {"rpm": 20, "rpd": 50, "credits_rpd": 1000, "credits_threshold": 10},

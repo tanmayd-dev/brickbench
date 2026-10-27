@@ -607,10 +607,11 @@ class Runner:
         prompt_variant = run["prompt_variant"]
         debloat_mode = run["debloat_mode"]
 
+        from brickbench.config import PACKAGE_SIZES
         dossier = {
             "total_packages": 130,
-            "critical_set": {"com.android.systemui", "com.android.phone"},
-            "pkg_sizes": {"com.example.app": 1_500_000},
+            "critical_set": {"com.android.systemui", "com.android.phone", "com.android.settings"},
+            "pkg_sizes": PACKAGE_SIZES,
         }
 
         plan_hash = "fake_hash_" + prompt_variant
@@ -656,14 +657,15 @@ class Runner:
             {"pkg": "com.android.dreams.basic", "action": "uninstall"},
         ]
 
+        from brickbench.config import PACKAGE_SIZES
         result = verify_plan(
             target_key=target_key,
             plan_hash="emu_" + prompt_variant,
             plan_actions=plan_actions,
             dossier={
                 "total_packages": 130,
-                "critical_set": {"com.android.systemui", "com.android.phone"},
-                "pkg_sizes": {},
+                "critical_set": {"com.android.systemui", "com.android.phone", "com.android.settings"},
+                "pkg_sizes": PACKAGE_SIZES,
             },
             model_id=model_id,
             prompt_variant=prompt_variant,

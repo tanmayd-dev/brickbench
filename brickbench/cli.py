@@ -219,15 +219,16 @@ def run_command(
             model_cfgs["codex"] = ["gpt-6-luna"]
         elif p == "openrouter":
             model_cfgs["openrouter"] = [
+                "openrouter/free", "thinkingmachines/inkling:free", "cohere/north-mini-code:free",
+                "nvidia/nemotron-3.5-lightning:free", "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "recursive/flint-v1.0:free", "xingchen-agi/xing4.0-29b-a4b:free",
                 "qwen/qwen3.8-27b:free", "google/gemma-4-31b-it:free", "google/gemma-4-26b-a4b-it:free",
-                "nvidia/nemotron-3-ultra-550b-a55b:free", "nvidia/nemotron-3.5-lightning:free",
                 "nvidia/nemotron-3-super-120b-a12b:free", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
-                "thinkingmachines/inkling:free", "thinkingmachines/inkling-small:free",
+                "thinkingmachines/inkling-small:free",
                 "poolside/laguna-s-2.1:free", "poolside/laguna-xs-2.1:free",
-                "cohere/north-mini-code:free", "dots-studio/dots-3-note-preview:free",
+                "dots-studio/dots-3-note-preview:free",
                 "inclusionai/ling-3.0-flash-sante:free", "liquid/lfm-2.5-2.6b:free",
                 "apodex/apodex-1.1-mini:free", "nvidia/nemotron-3.5-content-safety:free",
-                "recursive/flint-v1.0:free", "xingchen-agi/xing4.0-29b-a4b:free",
                 "nvidia/nemotron-3.5-super-vl:free", "deepseek/deepseek-v4.1-flash",
                 "meta-llama/llama-3.3-70b-instruct",
             ]
