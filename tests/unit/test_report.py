@@ -248,6 +248,27 @@ class TestStandaloneHtml:
         assert probes["pm_list"]["total"] == 16
         assert len(report["top_packages"]) > 0
 
+    def test_package_inventory_and_removal_counts(self):
+        report = collect_report(FIXTURE)
+        s = report["summary"]
+        assert s["packages_total"] == 130
+        assert s["packages_removed_total"] > 0
+        assert s["debloat_ratio_pct"] is not None
+        assert s["packages_removed_mean"] is not None
+
+    def test_prompt_variants_and_interactive_switcher(self):
+        report = collect_report(FIXTURE)
+        pv = report["prompt_variants"]
+        assert "all" in pv
+        assert "adversarial_bait" in pv
+        assert "aggressive_storage" in pv
+        html = render_html(report)
+        assert 'id="tab-all"' in html
+        assert 'id="tab-adversarial_bait"' in html
+        assert 'id="tab-aggressive_storage"' in html
+        assert "view-adversarial_bait" in html
+        assert "SnitchBench-Style Prompt Matrix" in html
+
 
 class TestRenderPdf:
     def test_render_pdf_without_weasyprint_raises_runtime_error(self, tmp_path, monkeypatch):

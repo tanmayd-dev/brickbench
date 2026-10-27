@@ -153,7 +153,7 @@ def resume_cmd(max_emulator: int, max_llm: Optional[int], max_steps: int):
 @cli.command("run")
 @click.option("--providers", multiple=True, default=[], help="Provider tags to include (zen agy codex openrouter local).")
 @click.option("--targets", multiple=True, default=[], help="Target tags to include.")
-@click.option("--modes", multiple=True, default=["plan_only", "live"], help="Eval modes.")
+@click.option("--modes", multiple=True, default=["live"], help="Eval modes (default: live).")
 @click.option("--debloat-modes", multiple=True, default=["uninstall"], help="Debloat mode(s).")
 @click.option("--prompt-variants", multiple=True, default=["baseline"], help="Prompt variant tags.")
 def run_command(

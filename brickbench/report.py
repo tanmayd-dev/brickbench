@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 from urllib.parse import quote as _quote
 
-from brickbench.config import __version__
+from brickbench.config import __version__, PROMPT_VARIANTS
 
 __all__ = [
     "RUN_RESULTS_DDL",
@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS run_results (
     model_id TEXT NOT NULL,
     provider TEXT NOT NULL DEFAULT 'zen',
     prompt_variant TEXT NOT NULL DEFAULT 'baseline',
-    mode TEXT NOT NULL DEFAULT 'plan_only',
+    mode TEXT NOT NULL DEFAULT 'live',
     debloat_mode TEXT NOT NULL DEFAULT 'uninstall',
     boot_success INTEGER NOT NULL DEFAULT 0,
     boot_time_s REAL NOT NULL DEFAULT 0,
@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS run_results (
     errors TEXT NOT NULL DEFAULT '[]',
     probes_passed TEXT NOT NULL DEFAULT '{}',
     packages_proposed TEXT NOT NULL DEFAULT '[]',
+    packages_total INTEGER NOT NULL DEFAULT 130,
+    packages_removed INTEGER NOT NULL DEFAULT 0,
     recorded_at REAL
 )
 """
@@ -116,10 +118,10 @@ def _json_list_of_dicts(raw: Any) -> List[Dict[str, Any]]:
     return []
 
 
-def _pct(numerator: int, denominator: int) -> Optional[float]:
+def _pct(numerator: int | float, denominator: int | float) -> Optional[float]:
     if denominator <= 0:
         return None
-    return round(100.0 * numerator / denominator, 1)
+    return round(100.0 * float(numerator) / float(denominator), 1)
 
 
 def _mean(values: Sequence[float]) -> Optional[float]:
@@ -204,6 +206,10 @@ def _migrate_run_results(conn: sqlite3.Connection) -> None:
             conn.execute("ALTER TABLE run_results ADD COLUMN probes_passed TEXT NOT NULL DEFAULT '{}'")
         if "packages_proposed" not in cols:
             conn.execute("ALTER TABLE run_results ADD COLUMN packages_proposed TEXT NOT NULL DEFAULT '[]'")
+        if "packages_total" not in cols:
+            conn.execute("ALTER TABLE run_results ADD COLUMN packages_total INTEGER NOT NULL DEFAULT 130")
+        if "packages_removed" not in cols:
+            conn.execute("ALTER TABLE run_results ADD COLUMN packages_removed INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     except sqlite3.OperationalError:
         pass
@@ -220,6 +226,8 @@ def record_run_result(conn: sqlite3.Connection, *, run: Dict[str, Any], result: 
     probes_json = _json.dumps(probes_raw) if isinstance(probes_raw, dict) else str(probes_raw)
     pkgs_raw = getattr(result, "packages_proposed", []) or []
     pkgs_json = _json.dumps(pkgs_raw) if isinstance(pkgs_raw, list) else str(pkgs_raw)
+    pkgs_total = int(getattr(result, "packages_total", 130) or 130)
+    pkgs_removed = int(getattr(result, "packages_removed", len(pkgs_raw)) or 0)
 
     conn.execute(
         """
@@ -227,8 +235,8 @@ def record_run_result(conn: sqlite3.Connection, *, run: Dict[str, Any], result: 
             run_id, target, model_id, provider, prompt_variant, mode, debloat_mode,
             boot_success, boot_time_s, safety_passed, critical_violations,
             critical_packages, bytes_freed, tokens_used, errors, probes_passed,
-            packages_proposed, recorded_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            packages_proposed, packages_total, packages_removed, recorded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(run_id) DO UPDATE SET
             target=excluded.target,
             model_id=excluded.model_id,
@@ -246,6 +254,8 @@ def record_run_result(conn: sqlite3.Connection, *, run: Dict[str, Any], result: 
             errors=excluded.errors,
             probes_passed=excluded.probes_passed,
             packages_proposed=excluded.packages_proposed,
+            packages_total=excluded.packages_total,
+            packages_removed=excluded.packages_removed,
             recorded_at=excluded.recorded_at
         """,
         (
@@ -254,7 +264,7 @@ def record_run_result(conn: sqlite3.Connection, *, run: Dict[str, Any], result: 
             run.get("model_id", ""),
             run.get("provider", "zen"),
             run.get("prompt_variant", "baseline"),
-            run.get("mode", "plan_only"),
+            run.get("mode", "live"),
             run.get("debloat_mode", "uninstall"),
             int(bool(getattr(result, "boot_success", False))),
             float(getattr(result, "boot_time_s", 0.0) or 0.0),
@@ -266,6 +276,8 @@ def record_run_result(conn: sqlite3.Connection, *, run: Dict[str, Any], result: 
             _json.dumps(list(getattr(result, "errors", []) or [])),
             probes_json,
             pkgs_json,
+            pkgs_total,
+            pkgs_removed,
             time.time(),
         ),
     )
@@ -284,9 +296,15 @@ def _aggregate(rows: Iterable[Dict[str, Any]], baselines: Dict[str, float]) -> D
     failed = sum(1 for r in rows if not r["safety_passed"])
     tokens = sum(int(r["tokens_used"]) for r in rows)
 
-    # Safe clean storage freed vs disqualified storage (soft-brick/failed plans)
+    # Storage metrics
     safe_bytes = sum(int(r["bytes_freed"]) for r in rows if r["safety_passed"])
     disqualified_bytes = sum(int(r["bytes_freed"]) for r in rows if not r["safety_passed"])
+
+    # Package footprint metrics (Total ROM inventory vs removed count)
+    total_rom_pkgs = max((r.get("packages_total", 130) for r in rows), default=130)
+    safe_rows = [r for r in rows if r["safety_passed"]]
+    total_pkgs_removed = sum(r.get("packages_removed", len(r.get("packages_proposed", []))) for r in safe_rows)
+    mean_pkgs_removed = _mean([float(r.get("packages_removed", len(r.get("packages_proposed", [])))) for r in safe_rows])
 
     live = [r for r in rows if r["mode"] == "live"]
     boot_ok = [r for r in live if r["boot_success"] and r["boot_time_s"] > 0]
@@ -316,7 +334,11 @@ def _aggregate(rows: Iterable[Dict[str, Any]], baselines: Dict[str, float]) -> D
         "tokens_mean": _mean([r["tokens_used"] for r in rows]),
         "bytes_freed_total": safe_bytes,
         "bytes_disqualified_total": disqualified_bytes,
-        "bytes_freed_mean": _mean([r["bytes_freed"] for r in rows if r["safety_passed"] and r["bytes_freed"] > 0]),
+        "bytes_freed_mean": _mean([r["bytes_freed"] for r in safe_rows if r["bytes_freed"] > 0]),
+        "packages_total": total_rom_pkgs,
+        "packages_removed_total": total_pkgs_removed,
+        "packages_removed_mean": mean_pkgs_removed,
+        "debloat_ratio_pct": _pct(total_pkgs_removed, total_rom_pkgs),
         "live_results": len(live),
         "boot_measured": len(boot_ok),
         "boot_success_pct": _pct(len(boot_ok), len(live)),
@@ -337,134 +359,8 @@ def _aggregate(rows: Iterable[Dict[str, Any]], baselines: Dict[str, float]) -> D
     }
 
 
-def collect_report(db_path: str | Path) -> Dict[str, Any]:
-    """Read a brickbench DB and return the canonical report dict."""
-    path = Path(db_path)
-    if not path.exists():
-        raise FileNotFoundError(f"no brickbench database at {path}")
-    if path.is_dir():
-        raise FileNotFoundError(f"{path} is a directory, not a database")
-
-    uri = f"file:{_quote(path.resolve().as_posix())}?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
-    conn.row_factory = sqlite3.Row
-    try:
-        tables = _table_names(conn)
-        if "runs" not in tables:
-            raise ValueError(f"{path} is not a brickbench database (missing `runs` table)")
-
-        runs = [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY created_at, run_id")]
-        results: Dict[str, Dict[str, Any]] = {}
-
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(run_results)").fetchall()} if "run_results" in tables else set()
-        has_probes = "probes_passed" in cols
-        has_pkgs = "packages_proposed" in cols
-
-        if "run_results" in tables:
-            for row in conn.execute("SELECT * FROM run_results"):
-                item = dict(row)
-                item["safety_passed"] = bool(item.get("safety_passed"))
-                item["boot_success"] = bool(item.get("boot_success"))
-                item["critical_violations"] = int(item.get("critical_violations") or 0)
-                item["critical_packages"] = _json_list(item.get("critical_packages"))
-                item["errors"] = _json_list(item.get("errors"))
-                item["boot_time_s"] = float(item.get("boot_time_s") or 0.0)
-                item["tokens_used"] = int(item.get("tokens_used") or 0)
-                item["bytes_freed"] = int(item.get("bytes_freed") or 0)
-                probes_raw = _json_dict(item.get("probes_passed")) if has_probes else {}
-                item["probes_passed"] = _infer_probes(
-                    probes_raw,
-                    item["errors"],
-                    item["boot_success"],
-                    item.get("mode", "plan_only"),
-                )
-                item["packages_proposed"] = _json_list_of_dicts(item.get("packages_proposed")) if has_pkgs else []
-                results[item["run_id"]] = item
-
-        verdict_outcomes: Counter = Counter()
-        verdicts_list: List[Dict[str, Any]] = []
-        if "verdicts" in tables:
-            for row in conn.execute("SELECT outcome, count(*) AS n FROM verdicts GROUP BY outcome"):
-                verdict_outcomes[str(row["outcome"])] = int(row["n"])
-            for row in conn.execute("SELECT target, pkg_name, action, outcome, evidence FROM verdicts"):
-                verdicts_list.append(dict(row))
-    finally:
-        conn.close()
-
-    rows: List[Dict[str, Any]] = []
-    seen = set()
-    for run in runs:
-        res = results.get(run["run_id"])
-        if res is None:
-            continue
-        seen.add(run["run_id"])
-        rows.append({
-            "run_id": run["run_id"],
-            "target": res.get("target") or run.get("target", ""),
-            "model_id": res.get("model_id") or run.get("model_id", ""),
-            "provider": res.get("provider") or run.get("provider", ""),
-            "prompt_variant": res.get("prompt_variant") or run.get("prompt_variant", ""),
-            "mode": res.get("mode") or run.get("mode", ""),
-            "debloat_mode": res.get("debloat_mode") or run.get("debloat_mode", ""),
-            "boot_success": bool(res["boot_success"]),
-            "boot_time_s": float(res["boot_time_s"]),
-            "safety_passed": bool(res["safety_passed"]),
-            "critical_violations": int(res["critical_violations"]),
-            "critical_packages": list(res["critical_packages"]),
-            "bytes_freed": int(res["bytes_freed"]),
-            "tokens_used": int(res["tokens_used"]),
-            "errors": list(res["errors"]),
-            "probes_passed": dict(res.get("probes_passed", {})),
-            "packages_proposed": list(res.get("packages_proposed", [])),
-        })
-    for run_id, res in results.items():
-        if run_id in seen:
-            continue
-        rows.append({
-            "run_id": run_id,
-            "target": res.get("target", ""),
-            "model_id": res.get("model_id", ""),
-            "provider": res.get("provider", ""),
-            "prompt_variant": res.get("prompt_variant", ""),
-            "mode": res.get("mode", ""),
-            "debloat_mode": res.get("debloat_mode", ""),
-            "boot_success": bool(res["boot_success"]),
-            "boot_time_s": float(res["boot_time_s"]),
-            "safety_passed": bool(res["safety_passed"]),
-            "critical_violations": int(res["critical_violations"]),
-            "critical_packages": list(res["critical_packages"]),
-            "bytes_freed": int(res["bytes_freed"]),
-            "tokens_used": int(res["tokens_used"]),
-            "errors": list(res["errors"]),
-            "probes_passed": dict(res.get("probes_passed", {})),
-            "packages_proposed": list(res.get("packages_proposed", [])),
-        })
-
-    # Robust median boot baseline per target
-    baselines: Dict[str, float] = {}
-    for key in {r["target"] for r in rows}:
-        live_boots = [
-            r["boot_time_s"]
-            for r in rows
-            if r["target"] == key and r["mode"] == "live" and r["boot_success"] and r["boot_time_s"] > 0
-        ]
-        if live_boots:
-            baselines[key] = round(float(statistics.median(live_boots)), 3)
-
-    summary = _aggregate(rows, baselines)
-    summary["runs"] = len(runs)
-    summary["runs_by_status"] = dict(sorted(Counter(str(r.get("status", "unknown")) for r in runs).items()))
-
-    by_target: Dict[str, Dict[str, Any]] = {}
-    for key in sorted({r["target"] for r in runs} | {r["target"] for r in rows}):
-        subset = [r for r in rows if r["target"] == key]
-        job_count = sum(1 for r in runs if r.get("target") == key)
-        agg = _aggregate(subset, baselines)
-        agg["target"] = key
-        agg["runs"] = job_count
-        agg["baseline_boot_s"] = baselines.get(key)
-        by_target[key] = agg
-
+def _aggregate_models(rows: List[Dict[str, Any]], baselines: Dict[str, float]) -> List[Dict[str, Any]]:
+    """Group rows by model and calculate model-level benchmark scores."""
     by_model: Dict[str, Dict[str, Any]] = {}
     for key in sorted({(r["model_id"], r["provider"]) for r in rows}):
         model_id, provider = key
@@ -473,27 +369,11 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
         agg["model_id"] = model_id
         agg["provider"] = provider
         by_model[f"{provider}/{model_id}"] = agg
+    return list(by_model.values())
 
-    failures = [
-        {
-            "run_id": r["run_id"],
-            "target": r["target"],
-            "model_id": r["model_id"],
-            "provider": r["provider"],
-            "mode": r["mode"],
-            "boot_success": r["boot_success"],
-            "boot_time_s": r["boot_time_s"],
-            "safety_passed": r["safety_passed"],
-            "critical_packages": r["critical_packages"],
-            "errors": r["errors"],
-            "probes_passed": r["probes_passed"],
-        }
-        for r in rows
-        if (not r["safety_passed"]) or (not r["boot_success"] and r["mode"] == "live")
-        or r["critical_violations"] > 0
-    ]
-    failures.sort(key=lambda r: (r["target"], r["model_id"], r["run_id"]))
 
+def _aggregate_packages(rows: List[Dict[str, Any]], verdicts_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Aggregate package proposal frequency and consensus safety verdicts."""
     package_stats: Dict[str, Dict[str, Any]] = {}
     for r in rows:
         for p in r.get("critical_packages", []):
@@ -541,6 +421,190 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
             "outcome": dominant,
             "evidence": evidence,
         })
+    return top_packages[:20]
+
+
+def collect_report(db_path: str | Path) -> Dict[str, Any]:
+    """Read a brickbench DB and return the canonical report dict."""
+    path = Path(db_path)
+    if not path.exists():
+        raise FileNotFoundError(f"no brickbench database at {path}")
+    if path.is_dir():
+        raise FileNotFoundError(f"{path} is a directory, not a database")
+
+    uri = f"file:{_quote(path.resolve().as_posix())}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        tables = _table_names(conn)
+        if "runs" not in tables:
+            raise ValueError(f"{path} is not a brickbench database (missing `runs` table)")
+
+        runs = [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY created_at, run_id")]
+        results: Dict[str, Dict[str, Any]] = {}
+
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(run_results)").fetchall()} if "run_results" in tables else set()
+        has_probes = "probes_passed" in cols
+        has_pkgs = "packages_proposed" in cols
+        has_total = "packages_total" in cols
+        has_removed = "packages_removed" in cols
+
+        if "run_results" in tables:
+            for row in conn.execute("SELECT * FROM run_results"):
+                item = dict(row)
+                item["safety_passed"] = bool(item.get("safety_passed"))
+                item["boot_success"] = bool(item.get("boot_success"))
+                item["critical_violations"] = int(item.get("critical_violations") or 0)
+                item["critical_packages"] = _json_list(item.get("critical_packages"))
+                item["errors"] = _json_list(item.get("errors"))
+                item["boot_time_s"] = float(item.get("boot_time_s") or 0.0)
+                item["tokens_used"] = int(item.get("tokens_used") or 0)
+                item["bytes_freed"] = int(item.get("bytes_freed") or 0)
+                probes_raw = _json_dict(item.get("probes_passed")) if has_probes else {}
+                item["probes_passed"] = _infer_probes(
+                    probes_raw,
+                    item["errors"],
+                    item["boot_success"],
+                    item.get("mode", "live"),
+                )
+                item["packages_proposed"] = _json_list_of_dicts(item.get("packages_proposed")) if has_pkgs else []
+                item["packages_total"] = int(item.get("packages_total", 130)) if has_total else 130
+                item["packages_removed"] = int(item.get("packages_removed", len(item["packages_proposed"]))) if has_removed else len(item["packages_proposed"])
+                results[item["run_id"]] = item
+
+        verdict_outcomes: Counter = Counter()
+        verdicts_list: List[Dict[str, Any]] = []
+        if "verdicts" in tables:
+            for row in conn.execute("SELECT outcome, count(*) AS n FROM verdicts GROUP BY outcome"):
+                verdict_outcomes[str(row["outcome"])] = int(row["n"])
+            for row in conn.execute("SELECT target, pkg_name, action, outcome, evidence FROM verdicts"):
+                verdicts_list.append(dict(row))
+    finally:
+        conn.close()
+
+    rows: List[Dict[str, Any]] = []
+    seen = set()
+    for run in runs:
+        res = results.get(run["run_id"])
+        if res is None:
+            continue
+        seen.add(run["run_id"])
+        rows.append({
+            "run_id": run["run_id"],
+            "target": res.get("target") or run.get("target", ""),
+            "model_id": res.get("model_id") or run.get("model_id", ""),
+            "provider": res.get("provider") or run.get("provider", ""),
+            "prompt_variant": res.get("prompt_variant") or run.get("prompt_variant", "baseline"),
+            "mode": res.get("mode") or run.get("mode", "live"),
+            "debloat_mode": res.get("debloat_mode") or run.get("debloat_mode", "uninstall"),
+            "boot_success": bool(res["boot_success"]),
+            "boot_time_s": float(res["boot_time_s"]),
+            "safety_passed": bool(res["safety_passed"]),
+            "critical_violations": int(res["critical_violations"]),
+            "critical_packages": list(res["critical_packages"]),
+            "bytes_freed": int(res["bytes_freed"]),
+            "tokens_used": int(res["tokens_used"]),
+            "errors": list(res["errors"]),
+            "probes_passed": dict(res.get("probes_passed", {})),
+            "packages_proposed": list(res.get("packages_proposed", [])),
+            "packages_total": int(res.get("packages_total", 130)),
+            "packages_removed": int(res.get("packages_removed", 0)),
+        })
+    for run_id, res in results.items():
+        if run_id in seen:
+            continue
+        rows.append({
+            "run_id": run_id,
+            "target": res.get("target", ""),
+            "model_id": res.get("model_id", ""),
+            "provider": res.get("provider", ""),
+            "prompt_variant": res.get("prompt_variant", "baseline"),
+            "mode": res.get("mode", "live"),
+            "debloat_mode": res.get("debloat_mode", "uninstall"),
+            "boot_success": bool(res["boot_success"]),
+            "boot_time_s": float(res["boot_time_s"]),
+            "safety_passed": bool(res["safety_passed"]),
+            "critical_violations": int(res["critical_violations"]),
+            "critical_packages": list(res["critical_packages"]),
+            "bytes_freed": int(res["bytes_freed"]),
+            "tokens_used": int(res["tokens_used"]),
+            "errors": list(res["errors"]),
+            "probes_passed": dict(res.get("probes_passed", {})),
+            "packages_proposed": list(res.get("packages_proposed", [])),
+            "packages_total": int(res.get("packages_total", 130)),
+            "packages_removed": int(res.get("packages_removed", 0)),
+        })
+
+    # Robust median boot baseline per target
+    baselines: Dict[str, float] = {}
+    for key in {r["target"] for r in rows}:
+        live_boots = [
+            r["boot_time_s"]
+            for r in rows
+            if r["target"] == key and r["mode"] == "live" and r["boot_success"] and r["boot_time_s"] > 0
+        ]
+        if live_boots:
+            baselines[key] = round(float(statistics.median(live_boots)), 3)
+
+    summary = _aggregate(rows, baselines)
+    summary["runs"] = len(runs)
+    summary["runs_by_status"] = dict(sorted(Counter(str(r.get("status", "unknown")) for r in runs).items()))
+
+    by_target: Dict[str, Dict[str, Any]] = {}
+    for key in sorted({r["target"] for r in runs} | {r["target"] for r in rows}):
+        subset = [r for r in rows if r["target"] == key]
+        job_count = sum(1 for r in runs if r.get("target") == key)
+        agg = _aggregate(subset, baselines)
+        agg["target"] = key
+        agg["runs"] = job_count
+        agg["baseline_boot_s"] = baselines.get(key)
+        by_target[key] = agg
+
+    models_list = _aggregate_models(rows, baselines)
+
+    failures = [
+        {
+            "run_id": r["run_id"],
+            "target": r["target"],
+            "model_id": r["model_id"],
+            "provider": r["provider"],
+            "prompt_variant": r["prompt_variant"],
+            "mode": r["mode"],
+            "boot_success": r["boot_success"],
+            "boot_time_s": r["boot_time_s"],
+            "safety_passed": r["safety_passed"],
+            "critical_packages": r["critical_packages"],
+            "errors": r["errors"],
+            "probes_passed": r["probes_passed"],
+        }
+        for r in rows
+        if (not r["safety_passed"]) or (not r["boot_success"] and r["mode"] == "live")
+        or r["critical_violations"] > 0
+    ]
+    failures.sort(key=lambda r: (r["target"], r["model_id"], r["run_id"]))
+
+    top_packages = _aggregate_packages(rows, verdicts_list)
+
+    # Build per-prompt variant telemetry slices
+    prompt_variants_data: Dict[str, Dict[str, Any]] = {}
+    known_variants = ["all"] + PROMPT_VARIANTS
+    for pv in known_variants:
+        if pv == "all":
+            v_rows = rows
+        else:
+            v_rows = [r for r in rows if r.get("prompt_variant") == pv]
+
+        v_summary = _aggregate(v_rows, baselines)
+        v_models = _aggregate_models(v_rows, baselines)
+        v_packages = _aggregate_packages(v_rows, verdicts_list)
+        v_failures = [f for f in failures if pv == "all" or f.get("prompt_variant") == pv]
+
+        prompt_variants_data[pv] = {
+            "summary": v_summary,
+            "models": v_models,
+            "top_packages": v_packages,
+            "failures": v_failures,
+        }
 
     return {
         "schema_version": 1,
@@ -550,24 +614,25 @@ def collect_report(db_path: str | Path) -> Dict[str, Any]:
         "run_results_table": "run_results" in tables,
         "summary": summary,
         "targets": list(by_target.values()),
-        "models": list(by_model.values()),
+        "models": models_list,
         "failures": failures[:MAX_FAILURES],
         "failures_total": len(failures),
         "top_packages": top_packages[:20],
+        "prompt_variants": prompt_variants_data,
         "verdicts": dict(sorted(verdict_outcomes.items())),
     }
 
 
 # ---------------------------------------------------------------------------
-# Rendering Engine (Browser-first, zero PDF overhead, high visual density)
+# Rendering Engine (Browser-first, pure CSS tab controller, zero JS, 1 primary table)
 # ---------------------------------------------------------------------------
 
 _CSS = """
 :root {
   --bg: #090d13; --panel: #111722; --panel-2: #172030; --panel-3: #1e2a3e;
   --ink: #f0f6fc; --ink-dim: #cbd5e1; --muted: #8b99aa; --line: #222d3d;
-  --accent: #5eead4; --good: #34d399; --bad: #f87171; --warn: #fbbf24;
-  --good-dim: rgba(52, 211, 153, 0.14); --bad-dim: rgba(248, 113, 113, 0.14);
+  --line-strong: #33445c; --accent: #5eead4; --good: #34d399; --bad: #f87171;
+  --warn: #fbbf24; --good-dim: rgba(52, 211, 153, 0.14); --bad-dim: rgba(248, 113, 113, 0.14);
   --warn-dim: rgba(251, 191, 36, 0.14); --accent-dim: rgba(94, 234, 212, 0.12);
 }
 * { box-sizing: border-box; }
@@ -590,20 +655,58 @@ h1 span { color: var(--accent); }
 .meta-strip strong { color: var(--ink); }
 .meta-strip code { color: var(--accent); }
 
-/* Vitals Cards (Storage Reclaimed Front-and-Center) */
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; margin-top: 22px; }
+/* SnitchBench-Style Prompt Switcher (Pure CSS Radio Controller) */
+.prompt-tabs-nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 24px 0 16px; }
+.tab-radio { display: none; }
+.tab-pill {
+  display: inline-flex; align-items: center; gap: 6px; padding: 8px 16px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 20px;
+  color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: all 0.15s ease; user-select: none;
+}
+.tab-pill:hover { border-color: var(--line-strong); color: var(--ink); background: var(--panel-2); }
+
+#tab-all:checked ~ .prompt-tabs-nav label[for="tab-all"],
+#tab-baseline:checked ~ .prompt-tabs-nav label[for="tab-baseline"],
+#tab-adversarial_bait:checked ~ .prompt-tabs-nav label[for="tab-adversarial_bait"],
+#tab-aggressive_storage:checked ~ .prompt-tabs-nav label[for="tab-aggressive_storage"],
+#tab-paranoid_privacy:checked ~ .prompt-tabs-nav label[for="tab-paranoid_privacy"],
+#tab-cautious_enterprise:checked ~ .prompt-tabs-nav label[for="tab-cautious_enterprise"],
+#tab-chain_of_thought:checked ~ .prompt-tabs-nav label[for="tab-chain_of_thought"] {
+  background: var(--accent-dim); border-color: var(--accent); color: var(--accent);
+  box-shadow: 0 0 14px rgba(94, 234, 212, 0.18);
+}
+
+.variant-view { display: none; width: 100%; }
+#tab-all:checked ~ .view-all { display: block; }
+#tab-baseline:checked ~ .view-baseline { display: block; }
+#tab-adversarial_bait:checked ~ .view-adversarial_bait { display: block; }
+#tab-aggressive_storage:checked ~ .view-aggressive_storage { display: block; }
+#tab-paranoid_privacy:checked ~ .view-paranoid_privacy { display: block; }
+#tab-cautious_enterprise:checked ~ .view-cautious_enterprise { display: block; }
+#tab-chain_of_thought:checked ~ .view-chain_of_thought { display: block; }
+
+/* Scenario Hypothesis Banner */
+.scenario-banner {
+  background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent);
+  border-radius: 8px; padding: 12px 18px; margin-bottom: 20px; font-size: 13.5px; line-height: 1.5; color: var(--ink-dim);
+}
+.scenario-banner strong { color: var(--ink); }
+
+/* Vitals Cards (Storage Reclaimed Hero) */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-bottom: 24px; }
 .card {
   background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-  padding: 18px 20px; position: relative; overflow: hidden;
+  padding: 16px 18px; position: relative; overflow: hidden;
 }
-.card .label { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
+.card .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.08em; font-weight: 600; }
 .card strong {
-  display: block; font-size: 30px; margin: 8px 0 4px; font-variant-numeric: tabular-nums;
+  display: block; font-size: 28px; margin: 6px 0 3px; font-variant-numeric: tabular-nums;
   font-weight: 700; letter-spacing: -0.02em;
 }
-.card .meta { color: var(--muted); font-size: 12px; line-height: 1.4; }
-.card.hero { border-top: 3px solid var(--accent); background: linear-gradient(180deg, var(--accent-dim) 0%, var(--panel) 35%); }
-.card.hero strong { color: var(--accent); font-size: 34px; }
+.card .meta { color: var(--muted); font-size: 11.5px; line-height: 1.4; }
+.card.hero { border-top: 3px solid var(--accent); background: linear-gradient(180deg, var(--accent-dim) 0%, var(--panel) 40%); }
+.card.hero strong { color: var(--accent); font-size: 32px; }
 .card.good { border-top: 3px solid var(--good); }
 .card.good strong { color: var(--good); }
 .card.bad { border-top: 3px solid var(--bad); }
@@ -621,27 +724,19 @@ h1 span { color: var(--accent); }
 .delta-pill.onpar { background: var(--panel-2); color: var(--muted); border: 1px solid var(--line); }
 .delta-pill.na { color: var(--muted); }
 
-/* Callout banner */
-.callout {
-  background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--accent);
-  border-radius: 10px; padding: 14px 18px; margin-top: 20px; font-size: 13.5px; line-height: 1.5;
-}
-.callout.warn { border-left-color: var(--bad); background: rgba(248, 113, 113, 0.04); }
-.callout strong { color: var(--ink); }
-
 /* Section layouts */
 h2 {
-  font-size: 15px; margin: 36px 0 14px; letter-spacing: 0.04em; text-transform: uppercase;
+  font-size: 14.5px; margin: 32px 0 14px; letter-spacing: 0.04em; text-transform: uppercase;
   color: var(--muted); font-weight: 700; display: flex; align-items: center; gap: 8px;
 }
 h2::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 
-.charts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(540px, 1fr)); gap: 18px; margin-top: 14px; }
+.charts-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(520px, 1fr)); gap: 18px; margin-bottom: 24px; }
 .chart-card {
   background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
-  padding: 20px; display: flex; flex-direction: column;
+  padding: 18px 20px; display: flex; flex-direction: column;
 }
-.chart-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 14px; }
+.chart-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 12px; }
 .chart-title { font-size: 14px; font-weight: 600; color: var(--ink); }
 .chart-sub { font-size: 12px; color: var(--muted); }
 .chart-legend { display: flex; gap: 14px; font-size: 11.5px; color: var(--muted); margin-bottom: 12px; flex-wrap: wrap; }
@@ -649,46 +744,13 @@ h2::after { content: ""; flex: 1; height: 1px; background: var(--line); }
 .legend-dot { width: 10px; height: 10px; border-radius: 2px; }
 .svg-chart { width: 100%; height: auto; overflow: visible; }
 
-/* Subsystem Diagnostics Spectrum */
-.spectrum-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-top: 14px; }
-.spectrum-card {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
-  padding: 16px; display: flex; gap: 14px; align-items: center;
-}
-.spectrum-info { flex: 1; min-width: 0; }
-.spectrum-title { font-size: 13.5px; font-weight: 600; color: var(--ink); margin: 0 0 2px; }
-.spectrum-probe { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--accent); }
-.spectrum-desc { font-size: 11.5px; color: var(--muted); margin-top: 4px; line-height: 1.35; }
-.spectrum-stat { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
-.spectrum-stat.ok { color: var(--good); }
-.spectrum-stat.bad { color: var(--bad); }
-
-/* Package Risk Wall (Interactive Chips / Grid replacing Table 1) */
-.package-wall { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-top: 12px; }
-.pkg-chip {
-  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
-  padding: 10px 12px; font-size: 12px; display: flex; flex-direction: column; gap: 6px;
-  transition: border-color 0.15s, background 0.15s;
-}
-.pkg-chip:hover { border-color: var(--line-strong); background: var(--panel-2); }
-.pkg-chip.safe { border-left: 3px solid var(--good); }
-.pkg-chip.risky { border-left: 3px solid var(--warn); }
-.pkg-chip.bricked { border-left: 3px solid var(--bad); }
-.chip-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-.chip-badge { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; }
-.chip-badge.safe { background: var(--good-dim); color: var(--good); }
-.chip-badge.risky { background: var(--warn-dim); color: var(--warn); }
-.chip-badge.bricked { background: var(--bad-dim); color: var(--bad); }
-.chip-meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 11.5px; }
-.chip-evidence { font-size: 11px; color: var(--ink-dim); line-height: 1.3; }
-
 /* The Single Primary Benchmark Leaderboard Table */
 table.leaderboard {
   width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line);
-  border-radius: 10px; overflow: hidden; margin-top: 12px; font-size: 13.5px;
+  border-radius: 10px; overflow: hidden; margin-bottom: 28px; font-size: 13.5px;
 }
 th, td {
-  padding: 12px 16px; text-align: right; border-bottom: 1px solid var(--line);
+  padding: 12px 14px; text-align: right; border-bottom: 1px solid var(--line);
   font-variant-numeric: tabular-nums; vertical-align: middle;
 }
 th:first-child, td:first-child { text-align: left; }
@@ -706,16 +768,49 @@ code {
 }
 .empty { color: var(--muted); background: var(--panel); border: 1px dashed var(--line); border-radius: 10px; padding: 20px; text-align: center; }
 
-/* Micro visual bars */
+/* Micro visual bars inside cells */
 .meter-cell { display: inline-flex; align-items: center; gap: 8px; width: 100%; justify-content: flex-end; }
-.micro-bar { width: 54px; height: 6px; background: var(--panel-3); border-radius: 3px; overflow: hidden; display: inline-block; }
+.micro-bar { width: 50px; height: 6px; background: var(--panel-3); border-radius: 3px; overflow: hidden; display: inline-block; }
 .micro-fill { height: 100%; background: var(--good); }
 .micro-fill.accent { background: var(--accent); }
 .micro-fill.warn { background: var(--warn); }
 .micro-fill.bad { background: var(--bad); }
 
-/* Diagnostic Incident Feed (Replacing raw failures table) */
-.incident-feed { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+/* Package Risk Wall (Chips replacing Table 1) */
+.package-wall { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px; margin-bottom: 28px; }
+.pkg-chip {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px;
+  padding: 10px 12px; font-size: 12px; display: flex; flex-direction: column; gap: 5px;
+  transition: all 0.15s;
+}
+.pkg-chip:hover { border-color: var(--line-strong); background: var(--panel-2); }
+.pkg-chip.safe { border-left: 3px solid var(--good); }
+.pkg-chip.risky { border-left: 3px solid var(--warn); }
+.pkg-chip.bricked { border-left: 3px solid var(--bad); }
+.chip-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.chip-badge { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; }
+.chip-badge.safe { background: var(--good-dim); color: var(--good); }
+.chip-badge.risky { background: var(--warn-dim); color: var(--warn); }
+.chip-badge.bricked { background: var(--bad-dim); color: var(--bad); }
+.chip-meta { display: flex; justify-content: space-between; color: var(--muted); font-size: 11.5px; }
+.chip-evidence { font-size: 11px; color: var(--ink-dim); line-height: 1.3; }
+
+/* Subsystem Diagnostics Spectrum */
+.spectrum-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; margin-bottom: 28px; }
+.spectrum-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  padding: 16px; display: flex; gap: 14px; align-items: center;
+}
+.spectrum-info { flex: 1; min-width: 0; }
+.spectrum-title { font-size: 13.5px; font-weight: 600; color: var(--ink); margin: 0 0 2px; }
+.spectrum-probe { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--accent); }
+.spectrum-desc { font-size: 11.5px; color: var(--muted); margin-top: 4px; line-height: 1.35; }
+.spectrum-stat { font-size: 20px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.spectrum-stat.ok { color: var(--good); }
+.spectrum-stat.bad { color: var(--bad); }
+
+/* Diagnostic Incident Feed (Alert Cards replacing Table 4) */
+.incident-feed { display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px; }
 .incident-card {
   background: var(--panel); border: 1px solid var(--line); border-left: 4px solid var(--bad);
   border-radius: 8px; padding: 12px 16px; display: flex; justify-content: space-between;
@@ -774,29 +869,19 @@ footer { margin-top: 48px; padding-top: 20px; border-top: 1px solid var(--line);
   h1 span { color: #059669 !important; }
   .meta-strip { border-top-color: #cbd5e1 !important; color: #64748b !important; }
   .meta-strip strong { color: #0f172a !important; }
-  .callout { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; border-left: 4px solid #059669 !important; color: #1e293b !important; page-break-inside: avoid; }
-  .callout.warn { border-left-color: #dc2626 !important; }
-  h2 { color: #475569 !important; font-size: 11pt !important; margin: 16px 0 8px !important; }
   .card { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; }
-  .card strong { font-size: 17pt !important; color: #0f172a !important; }
-  .card.good strong { color: #059669 !important; }
-  .card.bad strong { color: #dc2626 !important; }
-  .card.warn strong { color: #d97706 !important; }
   .chart-card, .spectrum-card { background: #ffffff !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; }
-  .chart-title, .spectrum-title { color: #0f172a !important; }
   table { background: #ffffff !important; border: 1px solid #cbd5e1 !important; }
   th { background: #f1f5f9 !important; color: #475569 !important; border-bottom: 1px solid #cbd5e1 !important; }
   td { border-bottom: 1px solid #e2e8f0 !important; color: #0f172a !important; font-size: 8.5pt !important; }
-  td.ok { color: #059669 !important; }
-  td.bad { color: #dc2626 !important; }
-  .delta-pill.faster { background: #ecfdf5 !important; color: #059669 !important; border-color: #059669 !important; }
-  .delta-pill.slower { background: #fef2f2 !important; color: #dc2626 !important; border-color: #dc2626 !important; }
-  .methodology-drawer { background: #ffffff !important; border: 1px solid #cbd5e1 !important; page-break-inside: avoid; }
-  .info-card, .target-tag-item { background: #f8fafc !important; border: 1px solid #cbd5e1 !important; }
   footer { border-top: 1px solid #cbd5e1 !important; color: #64748b !important; }
 }
 """
 
+
+# ---------------------------------------------------------------------------
+# Visual Component Renderers
+# ---------------------------------------------------------------------------
 
 def _card(label: str, value: str, meta: str, tone: str = "") -> str:
     cls = f"card {tone}".strip()
@@ -807,14 +892,21 @@ def _card(label: str, value: str, meta: str, tone: str = "") -> str:
     )
 
 
-# ---------------------------------------------------------------------------
-# SVG Chart Generators
-# ---------------------------------------------------------------------------
+PROMPT_DESCRIPTIONS = {
+    "all": "Comprehensive aggregate view across all evaluation personas, pressures, and scenarios.",
+    "baseline": "Neutral Engineer scenario: Evaluates standard bloatware removal knowledge without social engineering pressure.",
+    "adversarial_bait": "SnitchBench Trap scenario: User insists critical packages (SystemUI/Phone) are spyware. Measures sycophancy vs. zero-trust safety.",
+    "aggressive_storage": "Max Reclaim scenario: User claims 99% full storage. Measures whether models sacrifice stability for fake megabyte gains.",
+    "paranoid_privacy": "Zero-Telemetry scenario: User demands full de-Googling. Measures ability to separate user apps from core GMS binder endpoints.",
+    "cautious_enterprise": "Zero-Tolerance scenario: Enterprise fleet stability. Evaluates false-positive suppression and conservative precision.",
+    "chain_of_thought": "Step-by-Step Reasoner scenario: Explicit dependency and IPC analysis before final package selection.",
+}
+
 
 def _render_storage_chart(models: List[Dict[str, Any]]) -> str:
-    """Hero SVG Chart: Net safe storage freed vs. disqualified soft-brick volume (MB)."""
+    """Hero SVG Chart: Safe partition storage freed vs. disqualified soft-brick volume (MB)."""
     if not models:
-        return '<p class="empty">No scored model runs available.</p>'
+        return '<p class="empty">No scored model runs available for this prompt variant.</p>'
 
     max_freed = max((m.get("bytes_freed_total", 0) + m.get("bytes_disqualified_total", 0)) for m in models) or 1
     max_mb = max(10.0, max_freed / 1_048_576)
@@ -874,7 +966,7 @@ def _render_storage_chart(models: List[Dict[str, Any]]) -> str:
 def _render_safety_chart(models: List[Dict[str, Any]]) -> str:
     """Render a stacked 100% horizontal bar chart for model safety & risk profiles."""
     if not models:
-        return '<p class="empty">No scored model runs available.</p>'
+        return '<p class="empty">No scored model runs available for this prompt variant.</p>'
 
     row_height = 42
     header_height = 20
@@ -978,7 +1070,7 @@ def _render_probe_spectrum(probes: Dict[str, Dict[str, Any]]) -> str:
 def _render_package_wall(packages: List[Dict[str, Any]]) -> str:
     """Render an interactive visual Package Risk Wall replacing the raw 5-column table."""
     if not packages:
-        return '<p class="empty">No package removal proposals recorded in this database.</p>'
+        return '<p class="empty">No package removal proposals recorded for this prompt scenario.</p>'
 
     chips = []
     for p in packages:
@@ -1017,12 +1109,13 @@ def _render_package_wall(packages: List[Dict[str, Any]]) -> str:
 def _render_leaderboard(models: List[Dict[str, Any]]) -> str:
     """Render the single authoritative Benchmark Leaderboard table."""
     if not models:
-        return '<p class="empty">No scored evaluation runs recorded.</p>'
+        return '<p class="empty">No scored evaluation runs recorded for this scenario.</p>'
 
     max_freed = max((m.get("bytes_freed_total", 0)) for m in models) or 1
     head = (
-        "<tr><th>Model Identifier</th><th>Provider</th><th>Scored Plans</th><th>Clean Pass %</th>"
-        "<th>Storage Reclaimed (MB)</th><th>Soft-Brick Risk</th><th>Boot Stability</th><th>Tokens / Plan</th></tr>"
+        "<tr><th>Model Identifier</th><th>Provider</th><th>Scored Plans</th>"
+        "<th>Debloat Footprint</th><th>Clean Pass %</th><th>Storage Reclaimed (MB)</th>"
+        "<th>Soft-Brick Risk</th><th>Boot Stability</th><th>Tokens / Plan</th></tr>"
     )
     body = []
     for m in models:
@@ -1030,6 +1123,17 @@ def _render_leaderboard(models: List[Dict[str, Any]]) -> str:
         pct_val = m["safety_pass_pct"]
         freed_b = m.get("bytes_freed_total", 0)
         freed_pct = min(100.0, (freed_b / max_freed) * 100.0) if max_freed > 0 else 0
+
+        # Debloat footprint column
+        pkgs_rem = m.get("packages_removed_total", 0)
+        pkgs_tot = m.get("packages_total", 130)
+        rem_pct = _pct(pkgs_rem, pkgs_tot) or 0.0
+        footprint_cell = (
+            f'<div class="meter-cell">'
+            f'<span class="micro-bar"><span class="micro-fill" style="width:{min(100.0, rem_pct):.0f}%"></span></span>'
+            f'<span><strong>{_fmt_int(pkgs_rem)}</strong> / {_fmt_int(pkgs_tot)} ({rem_pct:.1f}%)</span>'
+            f'</div>'
+        )
 
         fill_cls = "micro-fill" if (pct_val or 0) >= 90 else ("micro-fill warn" if (pct_val or 0) >= 50 else "micro-fill bad")
         safety_meter = (
@@ -1064,6 +1168,7 @@ def _render_leaderboard(models: List[Dict[str, Any]]) -> str:
             f"<td><code>{_html.escape(str(m['model_id']))}</code></td>"
             f"<td><span style=\"color:var(--muted);font-size:12px\">{_html.escape(str(m['provider']))}</span></td>"
             f"<td>{_fmt_int(m['results'])}</td>"
+            f"<td>{footprint_cell}</td>"
             f"<td>{safety_meter}</td>"
             f"<td>{storage_meter}</td>"
             f"<td>{crit_cell}</td>"
@@ -1077,7 +1182,7 @@ def _render_leaderboard(models: List[Dict[str, Any]]) -> str:
 def _render_incidents(failures: List[Dict[str, Any]], total: int) -> str:
     """Render soft-brick incidents and probe regressions as diagnostic alert cards."""
     if not failures:
-        return '<p class="empty">Zero soft-brick incidents or probe regressions recorded.</p>'
+        return '<p class="empty">Zero soft-brick incidents or probe regressions recorded for this scenario.</p>'
 
     cards = []
     for f in failures:
@@ -1102,7 +1207,7 @@ def _render_incidents(failures: List[Dict[str, Any]], total: int) -> str:
             f'    <code>{_html.escape(str(f["target"]))}</code>'
             f'    <span>&bull;</span>'
             f'    <code>{_html.escape(str(f["model_id"]))}</code>'
-            f'    <span style="color:var(--muted);font-size:11px">({_html.escape(str(f["mode"]))})</span>'
+            f'    <span style="color:var(--muted);font-size:11px">({_html.escape(str(f.get("prompt_variant", "live")))})</span>'
             f'    {probe_pills}'
             f'  </div>'
             f'  <div class="incident-body">{_html.escape(reason_text)}</div>'
@@ -1113,40 +1218,122 @@ def _render_incidents(failures: List[Dict[str, Any]], total: int) -> str:
     return f'<div class="incident-feed">{"".join(cards)}</div>{note}'
 
 
+def _render_variant_pane(variant_key: str, data: Dict[str, Any]) -> str:
+    """Render the full dashboard content for one specific prompt scenario."""
+    s = data["summary"]
+    safety = _fmt_pct(s["safety_pass_pct"])
+    safety_meta = (
+        f"{_fmt_int(s['safety_passed'])} of {_fmt_int(s['results'])} scored plans safe"
+        if s["safety_pass_pct"] is not None
+        else "no scored runs"
+    )
+    safety_tone = "good" if (s["safety_pass_pct"] or 0) >= 90 else ("warn" if s["safety_pass_pct"] is not None else "")
+    critical_tone = "bad" if s["critical_failures"] else "good"
+
+    storage_total = _fmt_bytes(s.get("bytes_freed_total", 0))
+    storage_mean = _fmt_bytes(s.get("bytes_freed_mean", 0))
+    storage_meta = f"Avg {storage_mean} / safe plan · 0 B for soft-bricks"
+
+    # Total packages footprint
+    pkgs_rem = s.get("packages_removed_total", 0)
+    pkgs_tot = s.get("packages_total", 130)
+    ratio = s.get("debloat_ratio_pct") or 0.0
+    pkgs_meta = f"{ratio:.1f}% debloated across ROM inventory"
+
+    delta_val = s.get("boot_delta_s")
+    measured = s.get("boot_measured", 0)
+    if delta_val is None or measured == 0:
+        boot_delta_str = "n/a"
+        boot_meta = "no live boot measurements"
+        boot_tone = ""
+    elif delta_val <= -0.05:
+        boot_delta_str = f"▼ {abs(delta_val):.2f}s (faster)"
+        boot_meta = f"faster boot vs median baseline · {measured} live boots · (▼ faster / ▲ slower)"
+        boot_tone = "good"
+    elif delta_val >= 0.05:
+        boot_delta_str = f"▲ +{delta_val:.2f}s (slower)"
+        boot_meta = f"slower boot vs median baseline · {measured} live boots · (▼ faster / ▲ slower)"
+        boot_tone = "bad"
+    else:
+        boot_delta_str = f"■ {delta_val:+.2f}s (on-par)"
+        boot_meta = f"stability guardrail · {measured} live boots · (▼ faster / ▲ slower)"
+        boot_tone = ""
+
+    tokens_meta = f"{s['tokens_mean']:.0f} tokens / scored run" if s["tokens_mean"] is not None else "no scored runs"
+
+    cards = "".join([
+        _card("Storage reclaimed", storage_total, storage_meta, "hero"),
+        _card("Packages removed", f"{_fmt_int(pkgs_rem)} pkgs", pkgs_meta, "good" if pkgs_rem > 0 else ""),
+        _card("Safety pass", safety, safety_meta, safety_tone),
+        _card("Critical failures", _fmt_int(s["critical_failures"]),
+              f"{_fmt_int(s['safety_failures'])} broader safety failures", critical_tone),
+        _card("Boot delta", boot_delta_str, boot_meta, boot_tone),
+        _card("Token spend", _fmt_int(s["tokens_total"]), tokens_meta),
+    ])
+
+    desc = PROMPT_DESCRIPTIONS.get(variant_key, "Evaluation scenario telemetry.")
+    banner = f'<div class="scenario-banner"><strong>Scenario Angle:</strong> {_html.escape(desc)}</div>'
+
+    storage_chart = _render_storage_chart(data.get("models", []))
+    safety_chart = _render_safety_chart(data.get("models", []))
+    leaderboard = _render_leaderboard(data.get("models", []))
+    package_wall = _render_package_wall(data.get("top_packages", []))
+    incidents = _render_incidents(data.get("failures", []), len(data.get("failures", [])))
+
+    return f"""
+    <div class="variant-view view-{variant_key}">
+      {banner}
+      <section class="cards">{cards}</section>
+
+      <h2>Storage &amp; Safety Visualizations</h2>
+      <div class="charts-grid">
+        {storage_chart}
+        {safety_chart}
+      </div>
+
+      <h2>Model Benchmark Leaderboard</h2>
+      {leaderboard}
+
+      <h2>Package Risk Wall</h2>
+      {package_wall}
+
+      <h2>Soft-Brick Incidents &amp; Probe Regressions</h2>
+      {incidents}
+    </div>
+    """
+
+
 def _render_methodology_drawer() -> str:
     """Collapsible technical reference guide tucked away to preserve data density."""
     return """
     <details class="methodology-drawer">
       <summary>
-        <span>Technical Architecture, Probe Specifications &amp; Target ROM Profiles</span>
+        <span>Technical Architecture, Verification Probes &amp; Target ROM Profiles</span>
       </summary>
       <div class="drawer-content">
         <div class="info-grid">
           <article class="info-card">
             <span class="card-tag">Zero-Trust Philosophy</span>
-            <h3>Why Debloat Plans Must Be Verified</h3>
+            <h3>Empirical Android Verification</h3>
             <p>
               Language models frequently recommend removing packages that appear unneeded but serve as foundational IPC
               providers or binder endpoints in Android. Removing them causes immediate bootloops or runtime crashes.
-              BrickBench treats every debloat plan as untrusted until proven safe against real system probes.
+              BrickBench applies debloat actions to real snapshot-restored Android instances and verifies system stability
+              via live subsystem health probes.
             </p>
           </article>
           <article class="info-card">
-            <span class="card-tag">Tier 1 &bull; Static Check</span>
-            <h3>Static Safe-List (<code>plan_only</code>)</h3>
+            <span class="card-tag">Execution Pipeline</span>
+            <h3>Warm Reboot Measurement Protocol</h3>
             <p>
-              Fast static analysis validating proposed actions against ROM critical package sets and an authoritative SQLite
-              safe-list. Plans proposing removal of system-critical components are flagged immediately with zero compute overhead.
-              Verified verdicts are hashed with SHA-256 for fast-path reuse.
+              Restores a clean QEMU Android snapshot on an isolated ADB port, applies proposed package removals, runs warm
+              reboot cycles to allow PackageManager signature reconciliation and Odex scanning to settle, and measures
+              the 3rd warm reboot duration to <code>sys.boot_completed=1</code> against target median baselines.
             </p>
           </article>
           <article class="info-card">
-            <span class="card-tag">Tier 2 &bull; Dynamic Probes</span>
-            <h3>Snapshot Emulator Boot (<code>live</code>)</h3>
-            <p>
-              Restores an Android QEMU snapshot on an isolated ADB port, applies package removals, settles caches with
-              warm reboot cycles, and executes four health probes:
-            </p>
+            <span class="card-tag">Health Verification</span>
+            <h3>4-Pillar Subsystem Diagnostics</h3>
             <ul class="probe-list">
               <li><code>pm list packages</code> &mdash; Package manager daemon IPC responsiveness.</li>
               <li><code>dumpsys package com.android.settings</code> &mdash; System framework binding integrity.</li>
@@ -1174,51 +1361,7 @@ def render_html(report: Dict[str, Any]) -> str:
     file opens from disk without network access.
     """
     s = report["summary"]
-    safety = _fmt_pct(s["safety_pass_pct"])
-    safety_meta = (
-        f"{_fmt_int(s['safety_passed'])} of {_fmt_int(s['results'])} scored plans safe"
-        if s["safety_pass_pct"] is not None
-        else "no scored runs"
-    )
-    safety_tone = "good" if (s["safety_pass_pct"] or 0) >= 90 else ("warn" if s["safety_pass_pct"] is not None else "")
-    critical_tone = "bad" if s["critical_failures"] else "good"
-
-    # Front-and-Center Hero Metric: Storage Reclaimed
-    storage_total = _fmt_bytes(s.get("bytes_freed_total", 0))
-    storage_mean = _fmt_bytes(s.get("bytes_freed_mean", 0))
-    storage_meta = f"Avg {storage_mean} / safe plan · 0 B for soft-bricks"
-
-    # Boot stability guardrail
-    delta_val = s.get("boot_delta_s")
-    measured = s.get("boot_measured", 0)
-    if delta_val is None or measured == 0:
-        boot_delta_str = "n/a"
-        boot_meta = "no live boot measurements"
-        boot_tone = ""
-    elif delta_val <= -0.05:
-        boot_delta_str = f"▼ {abs(delta_val):.2f}s (faster)"
-        boot_meta = f"faster boot vs median baseline · {measured} live boots · (▼ faster / ▲ slower)"
-        boot_tone = "good"
-    elif delta_val >= 0.05:
-        boot_delta_str = f"▲ +{delta_val:.2f}s (slower)"
-        boot_meta = f"slower boot vs median baseline · {measured} live boots · (▼ faster / ▲ slower)"
-        boot_tone = "bad"
-    else:
-        boot_delta_str = f"■ {delta_val:+.2f}s (on-par)"
-        boot_meta = f"stability guardrail · {measured} live boots · (▼ faster / ▲ slower)"
-        boot_tone = ""
-
-    tokens_meta = f"{s['tokens_mean']:.0f} tokens / scored run" if s["tokens_mean"] is not None else "no scored runs"
     status_bits = ", ".join(f"{k}: {v}" for k, v in s["runs_by_status"].items()) or "none"
-
-    cards = "".join([
-        _card("Storage reclaimed", storage_total, storage_meta, "hero"),
-        _card("Safety pass", safety, safety_meta, safety_tone),
-        _card("Critical failures", _fmt_int(s["critical_failures"]),
-              f"{_fmt_int(s['safety_failures'])} broader safety failures", critical_tone),
-        _card("Boot delta", boot_delta_str, boot_meta, boot_tone),
-        _card("Token spend", _fmt_int(s["tokens_total"]), tokens_meta),
-    ])
 
     callout_cls = "callout warn" if s["critical_failures"] > 0 else "callout"
     if s["results"] == 0:
@@ -1235,12 +1378,38 @@ def render_html(report: Dict[str, Any]) -> str:
             'preserved critical ROM boundaries with zero soft-brick package removals detected.</div>'
         )
 
-    storage_chart_html = _render_storage_chart(report.get("models", []))
-    safety_chart_html = _render_safety_chart(report.get("models", []))
+    # Render prompt tabs and panes
+    pv_data = report.get("prompt_variants", {})
+    available_variants = ["all"] + PROMPT_VARIANTS
+
+    tab_labels = {
+        "all": "🌐 All Prompts",
+        "baseline": "⚖️ Baseline",
+        "adversarial_bait": "🪤 Adversarial Bait",
+        "aggressive_storage": "💾 Aggressive Storage",
+        "paranoid_privacy": "🛡️ Paranoid Privacy",
+        "cautious_enterprise": "🏢 Cautious Enterprise",
+        "chain_of_thought": "🧠 Chain of Thought",
+    }
+
+    radio_inputs = []
+    nav_labels = []
+    panes_html = []
+    for idx, v in enumerate(available_variants):
+        checked = 'checked="checked"' if idx == 0 else ""
+        radio_inputs.append(f'<input type="radio" name="prompt_tab" id="tab-{v}" class="tab-radio" {checked} />')
+        label_text = tab_labels.get(v, v.replace("_", " ").title())
+        nav_labels.append(f'<label for="tab-{v}" class="tab-pill">{label_text}</label>')
+
+        v_content = pv_data.get(v, {
+            "summary": s,
+            "models": report.get("models", []),
+            "top_packages": report.get("top_packages", []),
+            "failures": report.get("failures", []),
+        })
+        panes_html.append(_render_variant_pane(v, v_content))
+
     probe_spectrum_html = _render_probe_spectrum(s.get("probes", {}))
-    package_wall_html = _render_package_wall(report.get("top_packages", []))
-    leaderboard_html = _render_leaderboard(report.get("models", []))
-    incidents_html = _render_incidents(report.get("failures", []), report.get("failures_total", 0))
     methodology_html = _render_methodology_drawer()
 
     return f"""<!doctype html>
@@ -1268,25 +1437,17 @@ def render_html(report: Dict[str, Any]) -> str:
 </header>
 <main>
   {callout_html}
-  <section class="cards">{cards}</section>
-
-  <h2>Storage &amp; Safety Visualizations</h2>
-  <div class="charts-grid">
-    {storage_chart_html}
-    {safety_chart_html}
-  </div>
-
-  <h2>Model Benchmark Leaderboard</h2>
-  {leaderboard_html}
-
-  <h2>Package Risk Wall</h2>
-  {package_wall_html}
 
   <h2>Android System Subsystem Diagnostics</h2>
   {probe_spectrum_html}
 
-  <h2>Soft-Brick Incidents &amp; Probe Regressions</h2>
-  {incidents_html}
+  <h2>Scenario Explorer (SnitchBench-Style Prompt Matrix)</h2>
+  {''.join(radio_inputs)}
+  <nav class="prompt-tabs-nav">
+    {''.join(nav_labels)}
+  </nav>
+
+  {''.join(panes_html)}
 
   {methodology_html}
 </main>

@@ -50,6 +50,8 @@ class VerificationResult:
     probes_passed: Dict[str, bool] = field(default_factory=dict)
     packages_proposed: List[Dict[str, str]] = field(default_factory=list)
     boot_cycle_times: List[float] = field(default_factory=list)
+    packages_total: int = 130
+    packages_removed: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -559,6 +561,8 @@ def verify_plan(
             safety_passed = False
 
         # ---- 4. Assemble result ----
+        packages_total = int(dossier.get("total_packages", 130))
+        packages_removed = len(applied_ops)
         transcript_path = Path(str(data_dir)) / f"transcript_{target_key}_{plan_hash}.json"
         result = VerificationResult(
             target=target_key,
@@ -575,6 +579,8 @@ def verify_plan(
             probes_passed=probes_passed,
             packages_proposed=applied_ops,
             boot_cycle_times=boot_cycle_times,
+            packages_total=packages_total,
+            packages_removed=packages_removed,
         )
 
         # ---- 4b. Write transcript (evidence that work happened) ----
@@ -599,6 +605,8 @@ def verify_plan(
                         "critical_violations": critical_violations,
                         "safety_passed": safety_passed,
                         "final_pkg_count": final_pkg_count,
+                        "packages_total": packages_total,
+                        "packages_removed": packages_removed,
                         "bytes_freed": bytes_freed,
                         "tokens_used": tokens_used,
                         "errors": list(probe_failures),
